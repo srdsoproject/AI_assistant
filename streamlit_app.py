@@ -5,7 +5,7 @@ Flow for every question:
   small talk     -> normal chat
   otherwise      -> 1) search YOUR letters/documents (local, Drive & uploaded)  2) if not found -> search the internet
 """
-import os, re, io, glob, json, shutil, tempfile, datetime as dt
+import os, re, io, glob, json, shutil, zipfile, tempfile, datetime as dt
 import xml.etree.ElementTree as ET
 from urllib.parse import urlencode, quote_plus
 from email.utils import parsedate_to_datetime
@@ -70,6 +70,17 @@ LETTER_SYSTEM = """You are the Safety Branch Assistant. Summarize this official 
 Give: **Letter no. / date / issued by**, **Subject**, **Key instructions** (bullets), **Who must act (designations / departments)**,
 **Deadlines / compliance**, **Recommended action for end users**. If something isn't stated, write "not stated".
 If the text looks garbled (bad scan), say so."""
+
+COMPARE_SYSTEM = """You are the Safety Branch Assistant for Indian Railways officials and staff.
+You are given 2 or more official letters/documents (each with letter no., date, subject, and text).
+Compare them thoroughly using ONLY the provided text. Never invent rules, limits, letter numbers, designations, or dates.
+Format your comparison clearly:
+**1. Overview Table:** Markdown table comparing Document, Letter No., Date, Issued By, and Subject.
+**2. Key Differences & Changes:** Highlight what changed between earlier and later letters (rules, limits, procedures, responsibilities, deadlines).
+**3. Superseding / Prevailing Status:** Identify the latest instruction and whether any document modifies, clarifies, or supersedes another.
+**4. Common Instructions:** Rules or requirements that remain consistent across the documents.
+**5. Recommended Action for Staff:** Clear, consolidated steps for end users based on the prevailing instructions.
+Reply in the user's requested language (English, हिंदी, or मराठी). Be concise and accurate."""
 
 NEWS_SYSTEM = """You are the Safety Branch Assistant for Indian Railways staff. You get recent NEWS HEADLINES
 (numbered, with source and date). Summarize based ONLY on these headlines; cite [1], [2]; group related items;
@@ -460,6 +471,28 @@ def find_relevant_files(query, chunks=None, limit=5):
     return matched[:limit]
 
 
+def build_zip_bytes(file_items):
+    """Package unique existing files into an in-memory ZIP archive."""
+    buf = io.BytesIO()
+    seen_paths, seen_names = set(), set()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for item in file_items:
+            path = item.get("path", "")
+            name = item.get("name", "") or os.path.basename(path)
+            if not path or path in seen_paths or not os.path.exists(path):
+                continue
+            seen_paths.add(path)
+            arcname = name
+            n = 1
+            while arcname in seen_names:
+                stem, ext = os.path.splitext(name)
+                arcname = f"{stem}_{n}{ext}"
+                n += 1
+            seen_names.add(arcname)
+            zf.write(path, arcname=arcname)
+    return buf.getvalue()
+
+
 def label(c):
     return f"Letter No. {c['no'] or 'n/a'} dated {c['date'] or 'n/a'} | Sub: {c['subject'] or 'n/a'} | {c['source']} {c['page']}"
 
@@ -704,7 +737,7 @@ def render_msg(m, msg_idx=0):
 
 
 # ---------------- document viewer helper ----------------
-def render_document_viewer(letter):
+def render_document_viewer(letter, key_suffix=""):
     path = letter.get("path", "")
     name = letter.get("source", "document")
     if not path or not os.path.exists(path):
@@ -713,22 +746,33 @@ def render_document_viewer(letter):
 
     with open(path, "rb") as fh:
         file_bytes = fh.read()
-    st.download_button(f"⬇️ Download {name}", data=file_bytes, file_name=name, key=f"view_dl_{letter['id']}")
+    st.download_button(
+        f"⬇️ Download {name}",
+        data=file_bytes,
+        file_name=name,
+        key=f"view_dl_{letter['id']}_{key_suffix}",
+    )
 
-    with st.expander("📄 View document", expanded=False):
-        if path.lower().endswith(".pdf"):
-            try:
-                import pypdfium2 as pdfium
-                pdf = pdfium.PdfDocument(path)
-                total_pages = len(pdf)
-                default_p = min(max(int(letter.get("page_start", 1)), 1), total_pages)
-                pno = st.number_input("Page", min_value=1, max_value=total_pages, value=default_p, step=1, key=f"pg_{letter['id']}")
-                img = pdf[pno - 1].render(scale=2).to_pil()
-                st.image(img, caption=f"{name} — Page {pno} of {total_pages}", use_container_width=True)
-                return
-            except Exception:
-                pass
-        st.text(letter["text"][:10000])
+    if path.lower().endswith(".pdf"):
+        try:
+            import pypdfium2 as pdfium
+            pdf = pdfium.PdfDocument(path)
+            total_pages = len(pdf)
+            default_p = min(max(int(letter.get("page_start", 1)), 1), total_pages)
+            pno = st.number_input(
+                "Page",
+                min_value=1,
+                max_value=total_pages,
+                value=default_p,
+                step=1,
+                key=f"pg_{letter['id']}_{key_suffix}",
+            )
+            img = pdf[pno - 1].render(scale=2).to_pil()
+            st.image(img, caption=f"{name} — Page {pno} of {total_pages}", use_container_width=True)
+            return
+        except Exception:
+            pass
+    st.text(letter["text"][:10000])
 
 
 # ---------------- pages ----------------
@@ -801,38 +845,148 @@ def letters_page():
     st.caption(f"{len(df)} of {len(L)} letters")
     st.dataframe(df, use_container_width=True, hide_index=True)
 
-    st.markdown("### ✨ View & Summarize a letter")
+    st.markdown("### 📑 View, Download, Summarize & Compare")
     opts = {f"{l['no'] or 'n/a'} | {l['date'] or 'n/a'} | {(l['subject'] or l['text'][:60])[:70]}": l for l in L}
-    pick = st.selectbox("Choose letter", list(opts.keys()))
-    l = opts[pick]
+    opt_keys = list(opts.keys())
+    picks = st.multiselect(
+        "Select one or more letters / documents",
+        opt_keys,
+        default=[opt_keys[0]] if opt_keys else [],
+        help="Select multiple documents to view them together, download them, or compare them with AI.",
+    )
+    selected = [opts[k] for k in picks]
 
-    render_document_viewer(l)
+    # ---- Download prompt: current/selected vs all documents ----
+    dl_choice = st.radio(
+        "What would you like to download?",
+        ["Current / Selected document(s)", "All documents (ZIP)"],
+        horizontal=True,
+        key="dl_scope",
+    )
+    if dl_choice == "All documents (ZIP)":
+        all_files = idx.get("files") or [{"name": l["source"], "path": l.get("path", "")} for l in L]
+        zip_data = build_zip_bytes(all_files)
+        if zip_data:
+            st.download_button(
+                "📦 Download all documents (.zip)",
+                data=zip_data,
+                file_name="safety_branch_all_documents.zip",
+                mime="application/zip",
+                key="dl_all_zip",
+            )
+        else:
+            st.info("No downloadable files found on disk.")
+    else:
+        if not selected:
+            st.info("Select at least one document above to download.")
+        elif len(selected) == 1:
+            l0 = selected[0]
+            p0 = l0.get("path", "")
+            if p0 and os.path.exists(p0):
+                with open(p0, "rb") as fh:
+                    st.download_button(
+                        f"⬇️ Download current document ({l0['source']})",
+                        data=fh.read(),
+                        file_name=l0["source"],
+                        key=f"dl_curr_{l0['id']}",
+                    )
+            else:
+                st.info("Original file is not available on disk.")
+        else:
+            sel_files = [{"name": s["source"], "path": s.get("path", "")} for s in selected]
+            sel_zip = build_zip_bytes(sel_files)
+            if sel_zip:
+                st.download_button(
+                    f"📦 Download {len(selected)} selected documents (.zip)",
+                    data=sel_zip,
+                    file_name="selected_documents.zip",
+                    mime="application/zip",
+                    key="dl_sel_zip",
+                )
 
-    lang = st.radio("Summary language", ["English", "हिंदी", "मराठी"], horizontal=True)
-    if st.button("✨ Summarize & recommend"):
-        body = " ".join(l["text"].split()[:5000])
+    if not selected:
+        return
+
+    # ---- Multi-document viewer ----
+    with st.expander(f"📄 View selected document(s) ({len(selected)})", expanded=False):
+        for i, doc_item in enumerate(selected):
+            st.markdown(f"**{i + 1}. {doc_item['source']}** — Letter No. `{doc_item['no'] or 'n/a'}` ({doc_item['date'] or 'n/a'})")
+            render_document_viewer(doc_item, key_suffix=f"multi_{i}")
+            if i < len(selected) - 1:
+                st.markdown("<hr style='border:0;border-top:1px solid #ffffff22;margin:12px 0;'>", unsafe_allow_html=True)
+
+    # ---- AI Summary & Compare ----
+    lang = st.radio("AI output language", ["English", "हिंदी", "मराठी"], horizontal=True)
+    c_sum, c_cmp = st.columns(2)
+
+    if c_sum.button("✨ Summarize & recommend"):
+        target = selected[0]
+        body = " ".join(target["text"].split()[:5000])
         try:
             with st.spinner("Reading the letter…"):
                 summary = generate(LETTER_SYSTEM, [{"role": "user", "content":
-                    f"Write the summary in {lang}.\n\nLETTER (file {l['source']}, pages {l['page_start']}-{l['page_end']}):\n{body}"}])
-                st.session_state["letter_summary"] = {"id": l["id"], "lang": lang, "text": summary}
+                    f"Write the summary in {lang}.\n\nLETTER (file {target['source']}, pages {target['page_start']}-{target['page_end']}):\n{body}"}])
+                st.session_state["letter_summary"] = {"id": target["id"], "lang": lang, "text": summary, "letter": target}
         except Exception as e:
             st.error(f"Error: {e}")
 
+    if c_cmp.button("⚖️ Compare selected (AI)", disabled=len(selected) < 2):
+        per_doc_words = max(1200, 9000 // len(selected))
+        docs_ctx = []
+        for idx_s, s in enumerate(selected, 1):
+            snippet = " ".join(s["text"].split()[:per_doc_words])
+            docs_ctx.append(
+                f"=== DOCUMENT {idx_s} ===\n"
+                f"File: {s['source']} (pages {s['page_start']}-{s['page_end']})\n"
+                f"Letter No.: {s['no'] or 'n/a'} | Date: {s['date'] or 'n/a'} | Issued by: {s['issuer'] or 'n/a'}\n"
+                f"Subject: {s['subject'] or 'n/a'}\n\n{snippet}"
+            )
+        try:
+            with st.spinner("Comparing selected documents…"):
+                cmp_res = generate(COMPARE_SYSTEM, [{"role": "user", "content":
+                    f"Write the comparison in {lang}.\n\n" + "\n\n".join(docs_ctx)}])
+                st.session_state["letter_compare"] = {
+                    "ids": tuple(s["id"] for s in selected),
+                    "lang": lang,
+                    "text": cmp_res,
+                    "names": [s["source"] for s in selected],
+                }
+        except Exception as e:
+            st.error(f"Error: {e}")
+
+    if len(selected) < 2:
+        st.caption("Tip: Select 2 or more documents above to enable AI comparison.")
+
+    # ---- Display persisted Summary + WhatsApp share ----
     saved = st.session_state.get("letter_summary")
-    if saved and saved.get("id") == l["id"]:
+    if saved and saved.get("id") == selected[0]["id"]:
+        st.markdown("#### 📝 Letter Summary")
         st.markdown(saved["text"])
+        sl = saved.get("letter", selected[0])
         wa_msg = (
             f"*Safety Branch AI - Letter Summary*\n"
-            f"Letter No: {l['no'] or 'N/A'} | Date: {l['date'] or 'N/A'}\n"
-            f"Subject: {l['subject'] or 'N/A'}\n\n"
+            f"Letter No: {sl['no'] or 'N/A'} | Date: {sl['date'] or 'N/A'}\n"
+            f"Subject: {sl['subject'] or 'N/A'}\n\n"
             f"{saved['text']}"
         )
-        wa_url = f"https://wa.me/?text={quote_plus(wa_msg)}"
-        st.link_button("💬 Share summary via WhatsApp", wa_url)
+        st.link_button("💬 Share summary via WhatsApp", f"https://wa.me/?text={quote_plus(wa_msg)}")
+
+    # ---- Display persisted Comparison + WhatsApp share ----
+    saved_cmp = st.session_state.get("letter_compare")
+    if saved_cmp and saved_cmp.get("ids") == tuple(s["id"] for s in selected):
+        st.markdown("#### ⚖️ AI Document Comparison")
+        st.markdown(saved_cmp["text"])
+        wa_cmp = (
+            f"*Safety Branch AI - Document Comparison*\n"
+            f"Compared: {', '.join(saved_cmp['names'])}\n\n"
+            f"{saved_cmp['text']}"
+        )
+        st.link_button("💬 Share comparison via WhatsApp", f"https://wa.me/?text={quote_plus(wa_cmp)}")
 
     with st.expander("View extracted text"):
-        st.text(l["text"][:6000])
+        for idx_t, doc_item in enumerate(selected):
+            st.markdown(f"**{idx_t + 1}. {doc_item['source']} (Letter No. {doc_item['no'] or 'n/a'})**")
+            st.text(doc_item["text"][:4000])
 
 
 def news_page():
