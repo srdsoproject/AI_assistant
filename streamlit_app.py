@@ -314,9 +314,21 @@ def clear_drive_sync_cache():
         os.remove(sync_stamp)
 
 
-def sync_drive():
-    """Download new/changed PDF, DOCX, TXT, MD and Google Docs from the Drive folder. Returns a status dict."""
+def _get_drive_cfg():
     folder = cfg("GDRIVE_FOLDER_ID")
+    sa_info = None
+    try:
+        if "gcp_service_account" in st.secrets:
+            sa_info = dict(st.secrets["gcp_service_account"])
+    except Exception:
+        pass
+    return folder, sa_info
+
+
+def sync_drive(folder=None, sa_info=None):
+    """Download new/changed PDF, DOCX, TXT, MD and Google Docs from the Drive folder. Thread-safe."""
+    if folder is None:
+        folder, sa_info = _get_drive_cfg()
     os.makedirs(DRIVE_DIR, exist_ok=True)
     sync_stamp = os.path.join(DRIVE_DIR, "_last_sync.json")
     if folder and os.path.exists(sync_stamp):
@@ -326,19 +338,22 @@ def sync_drive():
                 return st_data.get("status", {"enabled": True, "files": 0, "error": None, "mode": st_data.get("mode")})
         except Exception:
             pass
-    try:
-        has_creds = "gcp_service_account" in st.secrets
-    except Exception:
-        has_creds = False
     if not folder:
         return {"enabled": False, "files": 0, "error": None, "mode": None}
-    if not has_creds:
-        return _sync_public(folder)
+    if not sa_info:
+        status = _sync_public(folder)
+        if not status.get("error"):
+            try:
+                with open(sync_stamp, "w") as fh:
+                    json.dump({"folder": folder, "ts": time.time(), "mode": "public", "status": status}, fh)
+            except Exception:
+                pass
+        return status
     try:
         from google.oauth2 import service_account
         from googleapiclient.discovery import build
         from googleapiclient.http import MediaIoBaseDownload
-        info = dict(st.secrets["gcp_service_account"])
+        info = dict(sa_info)
         info["private_key"] = info["private_key"].replace("\\n", "\n")
         creds = service_account.Credentials.from_service_account_info(
             info, scopes=["https://www.googleapis.com/auth/drive.readonly"])
@@ -346,7 +361,8 @@ def sync_drive():
         os.makedirs(DRIVE_SA, exist_ok=True)
         mpath = os.path.join(DRIVE_SA, "_manifest.json")
         manifest = json.load(open(mpath)) if os.path.exists(mpath) else {}
-        n = 0
+
+        to_dl, n = [], 0
         for f in _drive_list(svc, folder):
             name = re.sub(r"[^\w.\-() ]", "_", f["name"])
             export = f["mimeType"] == GDOC
@@ -357,17 +373,28 @@ def sync_drive():
             local = os.path.join(DRIVE_SA, f"{f['id'][:6]}_{name}")
             if manifest.get(f["id"]) == f["modifiedTime"] and os.path.exists(local):
                 n += 1
-                continue
-            req = (svc.files().export_media(fileId=f["id"], mimeType="application/pdf") if export
-                   else svc.files().get_media(fileId=f["id"], supportsAllDrives=True))
+            else:
+                to_dl.append((f, export, local))
+
+        def _dl_one(item):
+            f, export, local = item
+            s_local = build("drive", "v3", credentials=creds, cache_discovery=False)
+            req = (s_local.files().export_media(fileId=f["id"], mimeType="application/pdf") if export
+                   else s_local.files().get_media(fileId=f["id"], supportsAllDrives=True))
             buf, done = io.BytesIO(), False
             dl = MediaIoBaseDownload(buf, req, chunksize=5 * 1024 * 1024)
             while not done:
                 _, done = dl.next_chunk()
             with open(local, "wb") as fh:
                 fh.write(buf.getvalue())
-            manifest[f["id"]] = f["modifiedTime"]
-            n += 1
+            return f["id"], f["modifiedTime"]
+
+        if to_dl:
+            with ThreadPoolExecutor(max_workers=min(4, len(to_dl))) as pool:
+                for fid, mtime in pool.map(_dl_one, to_dl):
+                    manifest[fid] = mtime
+                    n += 1
+
         with open(mpath, "w") as fh:
             json.dump(manifest, fh)
         status = {"enabled": True, "files": n, "error": None, "mode": "private"}
@@ -435,22 +462,91 @@ def _parse_file_cached(path, name, ext, stats, lock):
             pass
 
     local_stats = {"ocr_ok": stats["ocr_ok"], "ocr_done": 0, "unread": 0}
-    pages = read_pdf_pages(path, local_stats) if ext == "pdf" else read_other(path)
+    skip_ocr = ext == "pdf" and not stats.get("allow_ocr", True)
+    if ext == "pdf":
+        run_stats = {**local_stats, "ocr_ok": False} if skip_ocr else local_stats
+        pages = read_pdf_pages(path, run_stats)
+        local_stats = run_stats
+    else:
+        pages = read_other(path)
     with lock:
         stats["ocr_done"] += local_stats["ocr_done"]
         stats["unread"] += local_stats["unread"]
-    try:
-        with open(cpath, "w", encoding="utf-8") as fh:
-            json.dump([[pno, txt] for pno, txt in pages], fh)
-    except Exception:
-        pass
+    if not skip_ocr:
+        try:
+            with open(cpath, "w", encoding="utf-8") as fh:
+                json.dump([[pno, txt] for pno, txt in pages], fh)
+        except Exception:
+            pass
     return split_letters(pages, name, path=path)
 
 
-@st.cache_resource(show_spinner="Syncing Drive & loading documents…")
+@st.cache_resource
+def get_bg_state():
+    return {"started": False, "running": False, "done": False, "needs_reload": False, "drive": None}
+
+
+def _bg_sync_worker(folder, sa_info, bg):
+    try:
+        dv = sync_drive(folder=folder, sa_info=sa_info)
+        bg["drive"] = dv
+        # Pre-parse & OCR all downloaded files into disk cache in the background
+        stats = {"ocr_ok": ocr_available(), "ocr_done": 0, "unread": 0}
+        lock = threading.Lock()
+        targets = []
+        for root in (DOC_DIR, DRIVE_DIR, UPLOAD_DIR):
+            if os.path.exists(root):
+                for path in sorted(glob.glob(os.path.join(root, "**", "*"), recursive=True)):
+                    if not os.path.isfile(path) or path.endswith("README.txt") or os.path.basename(path).startswith("_"):
+                        continue
+                    ext = path.lower().rsplit(".", 1)[-1]
+                    if ext in ("pdf", "docx", "txt", "md"):
+                        name = os.path.basename(path)
+                        if path.startswith(DRIVE_SA):
+                            name = name[7:]
+                        targets.append((path, name, ext))
+        if targets:
+            with ThreadPoolExecutor(max_workers=min(4, len(targets))) as pool:
+                list(pool.map(lambda t: _parse_file_cached(t[0], t[1], t[2], stats, lock), targets))
+        bg["needs_reload"] = True
+    except Exception as e:
+        bg["drive"] = {"enabled": bool(folder), "files": 0, "error": str(e)[:250], "mode": None}
+    finally:
+        bg["running"] = False
+        bg["done"] = True
+
+
+def start_bg_sync_if_needed(force=False):
+    folder, sa_info = _get_drive_cfg()
+    bg = get_bg_state()
+    if not folder:
+        return bg
+    if force:
+        clear_drive_sync_cache()
+        bg["started"] = False
+    if not bg["started"] and not bg["running"]:
+        bg["started"] = True
+        bg["running"] = True
+        bg["done"] = False
+        threading.Thread(target=_bg_sync_worker, args=(folder, sa_info, bg), daemon=True).start()
+    return bg
+
+
+@st.cache_resource(show_spinner="Loading available documents…")
 def build_index():
-    drive = sync_drive()
-    stats = {"ocr_ok": ocr_available(), "ocr_done": 0, "unread": 0}
+    bg = get_bg_state()
+    folder, _ = _get_drive_cfg()
+    if bg.get("drive"):
+        drive = bg["drive"]
+    elif not folder:
+        drive = {"enabled": False, "files": 0, "error": None, "mode": None}
+    else:
+        n_drive = sum(
+            1 for f in glob.glob(os.path.join(DRIVE_DIR, "**", "*"), recursive=True)
+            if os.path.isfile(f) and not os.path.basename(f).startswith("_")
+        )
+        drive = {"enabled": True, "files": n_drive, "error": None, "mode": "syncing"}
+    stats = {"ocr_ok": ocr_available(), "allow_ocr": not bg.get("running"), "ocr_done": 0, "unread": 0}
     letters, files, targets = [], [], []
     paths = []
     for root in (DOC_DIR, DRIVE_DIR, UPLOAD_DIR):
@@ -957,7 +1053,7 @@ def letters_page():
     if c_ref.button("🔄 Refresh", key="refresh_letters"):
         if dv.get("mode") == "public":
             shutil.rmtree(DRIVE_PUB, ignore_errors=True)
-        clear_drive_sync_cache()
+        start_bg_sync_if_needed(force=True)
         build_index.clear()
         st.rerun()
 
@@ -1208,6 +1304,10 @@ if check_password():
                 build_index.clear()
                 st.rerun()
 
+    bg = start_bg_sync_if_needed()
+    if bg.get("needs_reload"):
+        bg["needs_reload"] = False
+        build_index.clear()
     idx = build_index()
     stt = idx["stats"]
     with st.sidebar:
@@ -1224,6 +1324,8 @@ if check_password():
         if dv["enabled"] and dv["error"]:
             st.markdown('<span class="pill warn">☁️ Drive sync failed</span>', unsafe_allow_html=True)
             st.caption(dv["error"])
+        elif bg.get("running"):
+            st.markdown('<span class="pill warn">☁️ Syncing Drive in background…</span>', unsafe_allow_html=True)
         elif dv["enabled"]:
             kind = "public link" if dv.get("mode") == "public" else "private"
             st.markdown(f'<span class="pill ok">☁️ Drive ({kind}): {dv["files"]} file(s)</span>', unsafe_allow_html=True)
@@ -1235,7 +1337,7 @@ if check_password():
         if st.button("🔄 Sync / reload documents"):
             if dv.get("mode") == "public":
                 shutil.rmtree(DRIVE_PUB, ignore_errors=True)   # force a fresh download
-            clear_drive_sync_cache()
+            start_bg_sync_if_needed(force=True)
             build_index.clear()
             st.rerun()
         with st.expander("🔧 Diagnostics"):
