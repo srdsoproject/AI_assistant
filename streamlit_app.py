@@ -3,11 +3,11 @@ Safety Branch AI Assistant (Streamlit) - Groq + Gemini
 Flow for every question:
   news question  -> live headlines
   small talk     -> normal chat
-  otherwise      -> 1) search YOUR letters/documents  2) if not found -> search the internet
+  otherwise      -> 1) search YOUR letters/documents (local, Drive & uploaded)  2) if not found -> search the internet
 """
-import os, re, io, glob, json, tempfile, datetime as dt
+import os, re, io, glob, json, shutil, tempfile, datetime as dt
 import xml.etree.ElementTree as ET
-from urllib.parse import urlencode
+from urllib.parse import urlencode, quote_plus
 from email.utils import parsedate_to_datetime
 import requests
 import streamlit as st
@@ -17,6 +17,7 @@ from sklearn.metrics.pairwise import cosine_similarity
 st.set_page_config(page_title="Safety Branch AI", page_icon="🚆", layout="centered")
 
 DOC_DIR = os.path.join(os.path.dirname(__file__), "documents")
+UPLOAD_DIR = os.path.join(tempfile.gettempdir(), "safety_uploaded_docs")
 TOP_K, MIN_SCORE, MAX_OCR_PAGES = 6, 0.06, 400
 
 
@@ -32,14 +33,14 @@ def cfg(key, default=""):
 PROVIDER = cfg("LLM_PROVIDER", "groq").lower()
 FALLBACK = cfg("LLM_FALLBACK", "gemini").lower()
 GROQ_MODEL = cfg("GROQ_MODEL", "openai/gpt-oss-120b")
-GEMINI_MODEL = cfg("GEMINI_MODEL", "gemini-3.8-flash")
+GEMINI_MODEL = cfg("GEMINI_MODEL", "gemini-2.5-flash")
 GROQ_BACKUPS = ["openai/gpt-oss-20b"]
 GEMINI_BACKUPS = ["gemini-flash-latest"]
 
 # ---------------- prompts ----------------
 RAG_SYSTEM = """You are the Safety Branch Assistant for Indian Railways officials and staff.
-You get CONTEXT: excerpts of official letters/documents, each labelled with letter number, date and subject.
-Answer ONLY from the CONTEXT. Never invent rules, limits, letter numbers or dates.
+You get CONTEXT: excerpts of official letters/documents, each labeled with letter number, date and subject.
+Answer ONLY from the CONTEXT. Never invent rules, limits, letter numbers, designations or dates.
 Format your reply as:
 **Answer:** short, direct.
 **Applicable letter(s):** number, date, subject (cite as [1], [2]).
@@ -66,20 +67,20 @@ For specific railway rules, rule numbers, limits or SOP steps, never invent them
 say it is not from department documents, and tell them to verify with the official manual/letter."""
 
 LETTER_SYSTEM = """You are the Safety Branch Assistant. Summarize this official letter for end users, using ONLY its text.
-Give: **Letter no. / date / issued by**, **Subject**, **Key instructions** (bullets), **Who must act**,
+Give: **Letter no. / date / issued by**, **Subject**, **Key instructions** (bullets), **Who must act (designations / departments)**,
 **Deadlines / compliance**, **Recommended action for end users**. If something isn't stated, write "not stated".
 If the text looks garbled (bad scan), say so."""
 
 NEWS_SYSTEM = """You are the Safety Branch Assistant for Indian Railways staff. You get recent NEWS HEADLINES
 (numbered, with source and date). Summarize based ONLY on these headlines; cite [1], [2]; group related items;
 mention dates; never add details not in the headlines (you only see titles) - tell the user to open the link for
-detail. Reply in the user's language, short and clear. News is not official instructions."""
+details. Reply in the user's language, short and clear. News is not official instructions."""
 
 SMALLTALK = re.compile(r"^\s*(hi+|hello+|hey+|hii+|yo|namaste|namaskar|नमस्ते|हाय|हैलो|good (morning|afternoon|evening|night)|"
                        r"thanks?|thank you|thx|ok(ay)?|cool|nice|bye|who are you|what can you do|how are you|"
                        r"what'?s up|help)\b[\s\S]{0,40}$", re.I)
 
-SUGGESTIONS = ["📰 Latest Solapur division news", "👋 Hi, what can you do?",
+SUGGESTIONS = ["📰 Latest Solapur Division news", "👋 Hi, what can you do?",
                "📑 Which letter covers SPAD prevention?", "📝 Help me draft a safety circular"]
 
 # ---------------- styling ----------------
@@ -129,19 +130,18 @@ def check_password():
     pw = cfg("APP_PASSWORD")
     if not pw or st.session_state.get("auth"):
         return True
-    st.markdown('<div class="hero"><h1>🚆 Safety Branch AI</h1><p>locked in 🔒 enter the password</p></div>', unsafe_allow_html=True)
-    entered = st.text_input("Password", type="password", label_visibility="collapsed", placeholder="password…")
+    st.markdown('<div class="hero"><h1>🚆 Safety Branch AI</h1><p>Locked in 🔒 Enter the password</p></div>', unsafe_allow_html=True)
+    entered = st.text_input("Password", type="password", label_visibility="collapsed", placeholder="Password…")
     if st.button("Let me in 🚀"):
         if entered == pw:
             st.session_state.auth = True
             st.rerun()
         else:
-            st.error("Nope, wrong password")
+            st.error("Incorrect password. Please try again.")
     return False
 
 
 # ---------------- letter splitting & metadata ----------------
-
 _MONTHS = ["january", "february", "march", "april", "may", "june", "july",
            "august", "september", "october", "november", "december"]
 MONTH_NUM = {m: i for i, m in enumerate(_MONTHS, 1)}
@@ -151,10 +151,21 @@ SUB_RE = re.compile(r"(?<![A-Za-z])(sub(?:ject)?|विषय)\s*[:\-–.]+", re
 NO_RE = re.compile(r"(?<![A-Za-z])(?:letter\s*)?(?:file\s*)?no\.?\s*[:\-–]?\s*([A-Z0-9][^\n]{2,50})", re.I)
 DATE_NUM_RE = re.compile(r"\b(\d{1,2})[./-](\d{1,2})[./-](\d{4}|\d{2})\b")
 DATE_TXT_RE = re.compile(r"\b(\d{1,2})(?:st|nd|rd|th)?[ ,.\-]+([A-Za-z]{3,9})[ ,.\-]+(\d{4})\b")
-HDR_RE = re.compile(r"(government of india|ministry of railways|railway board|central railway|"
-                    r"office of the|divisional railway manager|senior divisional|भारत सरकार|रेल मंत्रालय|"
-                    r"मध्य रेल|मंडल रेल|solapur division)", re.I)
-ISSUER_RE = re.compile(r"(railway|division|zone|board|ministry|office|रेल|मंडल|कार्यालय)", re.I)
+HDR_RE = re.compile(
+    r"(government of india|ministry of railways|railway board|central railway|"
+    r"office of the|divisional railway manager|additional divisional railway manager|"
+    r"senior divisional(?:\s+safety)?\s+officer|sr\.?\s*dso|divisional safety officer|"
+    r"principal chief safety officer|pcso|chief safety officer|commissioner of railway safety|"
+    r"safety branch|solapur division|भारत सरकार|रेल मंत्रालय|मध्य रेल|मंडल रेल|"
+    r"वरिष्ठ मंडल संरक्षा अधिकारी|मुख्य संरक्षा अधिकारी|संरक्षा शाखा)",
+    re.I,
+)
+ISSUER_RE = re.compile(
+    r"(railway|division|zone|board|ministry|office|safety|sanraksha|officer|manager|"
+    r"counsellor|inspector|superintendent|sr\.?\s*dso|drm|adrm|pcso|cso|crs|"
+    r"रेल|मंडल|कार्यालय|संरक्षा|अधिकारी|प्रबंधक|निरीक्षक|शाखा)",
+    re.I,
+)
 
 
 def parse_date(s):
@@ -207,7 +218,7 @@ def extract_meta(text):
     return {"no": no, "date": d.isoformat() if d else "", "subject": subject, "issuer": issuer}
 
 
-def split_letters(pages, source=""):
+def split_letters(pages, source="", path=""):
     """pages: list of (page_no, text). Returns list of letter dicts."""
     letters, cur = [], None
     for pno, text in pages:
@@ -216,7 +227,7 @@ def split_letters(pages, source=""):
         if cur is None or is_letter_start(text):
             if cur:
                 letters.append(cur)
-            cur = {"source": source, "pages": [], **extract_meta(text)}
+            cur = {"source": source, "path": path, "pages": [], **extract_meta(text)}
         cur["pages"].append((pno, text))
     if cur:
         letters.append(cur)
@@ -230,15 +241,15 @@ def split_letters(pages, source=""):
 def chunk_letters(letters, words=220, overlap=40):
     chunks = []
     for l in letters:
-        prefix = f"Letter No. {l['no']} dated {l['date']} Sub: {l['subject']}. "
+        prefix = f"File: {l['source']} Letter No. {l['no']} dated {l['date']} Sub: {l['subject']}. "
         for pno, text in l["pages"]:
             w = re.sub(r"\s+", " ", text or "").split()
             for i in range(0, max(len(w), 1), words - overlap):
                 piece = " ".join(w[i:i + words])
                 if len(piece) > 40:
-                    chunks.append({"letter_id": l["id"], "source": l["source"], "page": f"p.{pno}",
-                                   "no": l["no"], "date": l["date"], "subject": l["subject"],
-                                   "text": piece, "search": prefix + piece})
+                    chunks.append({"letter_id": l["id"], "source": l["source"], "path": l.get("path", ""),
+                                   "page": f"p.{pno}", "no": l["no"], "date": l["date"],
+                                   "subject": l["subject"], "text": piece, "search": prefix + piece})
     return chunks
 
 
@@ -246,7 +257,6 @@ def chunk_letters(letters, words=220, overlap=40):
 DRIVE_DIR = os.path.join(tempfile.gettempdir(), "safety_drive_docs")
 DRIVE_SA = os.path.join(DRIVE_DIR, "private")   # service-account downloads
 DRIVE_PUB = os.path.join(DRIVE_DIR, "public")   # public-link downloads
-import shutil
 GDOC = "application/vnd.google-apps.document"
 
 
@@ -383,10 +393,11 @@ def read_other(path):
 def build_index():
     drive = sync_drive()
     stats = {"ocr_ok": ocr_available(), "ocr_done": 0, "unread": 0}
-    letters = []
+    letters, files = [], []
     paths = []
-    for root in (DOC_DIR, DRIVE_DIR):
-        paths += sorted(glob.glob(os.path.join(root, "**", "*"), recursive=True))
+    for root in (DOC_DIR, DRIVE_DIR, UPLOAD_DIR):
+        if os.path.exists(root):
+            paths += sorted(glob.glob(os.path.join(root, "**", "*"), recursive=True))
     for path in paths:
         if not os.path.isfile(path) or path.endswith("README.txt"):
             continue
@@ -396,9 +407,10 @@ def build_index():
         name = os.path.basename(path)
         if path.startswith(DRIVE_SA):
             name = name[7:]                      # drop the id prefix added when downloading
+        files.append({"name": name, "path": path})
         try:
             pages = read_pdf_pages(path, stats) if ext == "pdf" else read_other(path)
-            letters += split_letters(pages, name)
+            letters += split_letters(pages, name, path=path)
         except Exception as e:
             print(f"Could not read {path}: {e}")
     chunks = chunk_letters(letters)
@@ -406,7 +418,7 @@ def build_index():
     if chunks:
         vec = TfidfVectorizer(ngram_range=(1, 2), sublinear_tf=True, stop_words="english")
         matrix = vec.fit_transform([c["search"] for c in chunks])
-    return {"letters": letters, "chunks": chunks, "vec": vec, "matrix": matrix, "stats": stats, "drive": drive}
+    return {"letters": letters, "files": files, "chunks": chunks, "vec": vec, "matrix": matrix, "stats": stats, "drive": drive}
 
 
 def retrieve(query):
@@ -418,6 +430,34 @@ def retrieve(query):
     except Exception:
         return []
     return [idx["chunks"][i] for i in scores.argsort()[::-1][:TOP_K] if scores[i] > MIN_SCORE]
+
+
+def find_relevant_files(query, chunks=None, limit=5):
+    """Return unique matching files from retrieved chunks + filename/metadata matches."""
+    idx = build_index()
+    seen, matched = set(), []
+
+    def add_file(path, name, no="", date="", subject=""):
+        if not path or path in seen or not os.path.exists(path):
+            return
+        seen.add(path)
+        matched.append({"path": path, "name": name, "no": no, "date": date, "subject": subject})
+
+    for c in (chunks or []):
+        add_file(c.get("path", ""), c.get("source", ""), c.get("no", ""), c.get("date", ""), c.get("subject", ""))
+
+    tokens = [t for t in re.findall(r"[a-z0-9\u0900-\u097f]{3,}", query.lower())
+              if t not in {"the", "and", "for", "with", "from", "this", "that", "file", "files", "letter", "letters", "document", "documents", "find", "search", "show", "give", "send", "uploaded"}]
+    if tokens:
+        for l in idx["letters"]:
+            meta = f"{l['source']} {l['no']} {l['date']} {l['subject']} {l['issuer']}".lower()
+            if any(t in meta for t in tokens):
+                add_file(l.get("path", ""), l.get("source", ""), l.get("no", ""), l.get("date", ""), l.get("subject", ""))
+        for f in idx.get("files", []):
+            if any(t in f["name"].lower() for t in tokens):
+                add_file(f["path"], f["name"])
+
+    return matched[:limit]
 
 
 def label(c):
@@ -603,7 +643,7 @@ def pick_days(q):
 
 # ---------------- answer pipeline ----------------
 def answer(question, history):
-    """Returns (text, sources, mode); mode in news | doc | web | chat."""
+    """Returns (text, sources, mode, files); mode in news | doc | web | chat."""
     hist = [{"role": m["role"], "content": m["content"]} for m in history[-8:]]
 
     if NEWS_WORDS.search(question):
@@ -611,44 +651,89 @@ def answer(question, history):
         try:
             items = fetch_news(NEWS_TOPICS[topic], days=days)[:12] or fetch_news(NEWS_TOPICS[topic], days=365)[:12]
         except Exception as e:
-            return f"⚠️ Couldn't fetch news right now ({e}). Try again in a bit.", [], "chat"
+            return f"⚠️ Couldn't fetch news right now ({e}). Try again in a bit.", [], "chat", []
         if items:
             ctx = "\n".join(f"[{i}] {n['title']} ({n['source']}, {fmt_when(n['when'])})" for i, n in enumerate(items, 1))
             text = generate(NEWS_SYSTEM, hist + [{"role": "user", "content": f"NEWS HEADLINES ({topic}):\n{ctx}\n\nQUESTION: {question}"}])
-            return text, [f"[{i}] [{n['title']}]({n['link']}) - {n['source']}, {fmt_when(n['when'])}" for i, n in enumerate(items, 1)], "news"
+            return text, [f"[{i}] [{n['title']}]({n['link']}) - {n['source']}, {fmt_when(n['when'])}" for i, n in enumerate(items, 1)], "news", []
 
     if SMALLTALK.match(question):
-        return generate(CHAT_SYSTEM, hist + [{"role": "user", "content": question}]), [], "chat"
+        return generate(CHAT_SYSTEM, hist + [{"role": "user", "content": question}]), [], "chat", []
 
-    ctx = retrieve(question)                                   # 1) department letters
+    ctx = retrieve(question)                                   # 1) department & uploaded letters
+    matched_files = find_relevant_files(question, ctx)
     if ctx:
         context = "\n\n".join(f"[{i}] {label(c)}\n{c['text']}" for i, c in enumerate(ctx, 1))
         text = generate(RAG_SYSTEM, hist + [{"role": "user", "content": f"CONTEXT:\n{context}\n\nQUESTION: {question}"}])
         if "NOT_FOUND_IN_DOCUMENTS" not in text:
-            return text, [f"[{i}] {label(c)}" for i, c in enumerate(ctx, 1)], "doc"
+            return text, [f"[{i}] {label(c)}" for i, c in enumerate(ctx, 1)], "doc", matched_files
+
+    if matched_files:
+        file_list = "\n".join(f"- **{f['name']}**" + (f" (Letter No. {f['no']}, {f['date']})" if f.get("no") else "") for f in matched_files)
+        return f"📑 I found relevant document(s) matching your query:\n\n{file_list}\n\nDownload them below or ask a specific question about their contents.", [], "doc", matched_files
 
     try:                                                        # 2) internet
         text, srcs = web_answer(question, hist)
-        return text, srcs, "web"
+        return text, srcs, "web", []
     except Exception as e:
         text = generate(CHAT_SYSTEM, hist + [{"role": "user", "content": question}])
-        return text + f"\n\n_(Letters had no match and web search failed: {e})_", [], "chat"
+        return text + f"\n\n_(Letters had no match and web search failed: {e})_", [], "chat", []
 
 
-def render_msg(m):
+def render_msg(m, msg_idx=0):
     if m["role"] == "assistant" and m.get("mode"):
         lab = {"doc": "📚 from your letters", "news": "📰 live news", "web": "🌐 from the internet"}.get(m["mode"], "💬 general chat")
         cls = {"doc": "doc", "news": "doc", "web": "web"}.get(m["mode"], "chat")
         st.markdown(f'<span class="badge {cls}">{lab}</span>', unsafe_allow_html=True)
     st.markdown(m["content"])
+    if m.get("files"):
+        st.markdown("**📎 Relevant file(s):**")
+        cols = st.columns(min(len(m["files"]), 3))
+        for j, f in enumerate(m["files"]):
+            if os.path.exists(f["path"]):
+                with open(f["path"], "rb") as fh:
+                    cols[j % len(cols)].download_button(
+                        label=f"⬇️ {f['name'][:28]}",
+                        data=fh.read(),
+                        file_name=f["name"],
+                        key=f"dl_{msg_idx}_{j}_{f['name']}",
+                    )
     if m.get("sources"):
         with st.expander("Sources"):
             st.markdown("\n\n".join(m["sources"]))
 
 
+# ---------------- document viewer helper ----------------
+def render_document_viewer(letter):
+    path = letter.get("path", "")
+    name = letter.get("source", "document")
+    if not path or not os.path.exists(path):
+        st.info("Original file is not available on disk.")
+        return
+
+    with open(path, "rb") as fh:
+        file_bytes = fh.read()
+    st.download_button(f"⬇️ Download {name}", data=file_bytes, file_name=name, key=f"view_dl_{letter['id']}")
+
+    with st.expander("📄 View document", expanded=False):
+        if path.lower().endswith(".pdf"):
+            try:
+                import pypdfium2 as pdfium
+                pdf = pdfium.PdfDocument(path)
+                total_pages = len(pdf)
+                default_p = min(max(int(letter.get("page_start", 1)), 1), total_pages)
+                pno = st.number_input("Page", min_value=1, max_value=total_pages, value=default_p, step=1, key=f"pg_{letter['id']}")
+                img = pdf[pno - 1].render(scale=2).to_pil()
+                st.image(img, caption=f"{name} — Page {pno} of {total_pages}", use_container_width=True)
+                return
+            except Exception:
+                pass
+        st.text(letter["text"][:10000])
+
+
 # ---------------- pages ----------------
 def chat_page():
-    st.markdown('<div class="hero"><h1>Safety Branch AI</h1><p>letters first, internet if needed · हिंदी / English / मराठी</p></div>', unsafe_allow_html=True)
+    st.markdown('<div class="hero"><h1>Safety Branch AI</h1><p>Letters first, internet if needed · हिंदी / English / मराठी</p></div>', unsafe_allow_html=True)
     st.session_state.setdefault("history", [])
     if not st.session_state.history:
         st.markdown("**Try one:**")
@@ -657,32 +742,41 @@ def chat_page():
             if cols[i % 2].button(sg, key=f"sug{i}"):
                 st.session_state.pending = sg.split(" ", 1)[1]
                 st.rerun()
-    for m in st.session_state.history:
+    for idx_m, m in enumerate(st.session_state.history):
         with st.chat_message(m["role"]):
-            render_msg(m)
-    q = st.chat_input("say something… / कुछ पूछो…") or st.session_state.pop("pending", None)
+            render_msg(m, msg_idx=idx_m)
+    q = st.chat_input("Ask a question… / कुछ पूछें…") or st.session_state.pop("pending", None)
     if q:
         with st.chat_message("user"):
             st.markdown(q)
         with st.chat_message("assistant"):
-            with st.spinner("checking your letters…"):
+            with st.spinner("Checking your letters…"):
                 try:
-                    a, srcs, mode = answer(q, st.session_state.history)
+                    a, srcs, mode, files = answer(q, st.session_state.history)
                 except Exception as e:
-                    a, srcs, mode = f"⚠️ Error: {e}\n\nIf it names a provider, check that key/model name in Secrets.", [], None
-            msg = {"role": "assistant", "content": a, "sources": srcs, "mode": mode}
-            render_msg(msg)
+                    a, srcs, mode, files = f"⚠️ Error: {e}\n\nIf it names a provider, check that key/model name in Secrets.", [], None, []
+            msg = {"role": "assistant", "content": a, "sources": srcs, "mode": mode, "files": files}
+            render_msg(msg, msg_idx=len(st.session_state.history))
         st.session_state.history += [{"role": "user", "content": q}, msg]
 
 
 def letters_page():
     import pandas as pd
-    st.markdown('<div class="hero"><h1>Letter Register</h1><p>every letter found in your documents</p></div>', unsafe_allow_html=True)
+    st.markdown('<div class="hero"><h1>Letter Register</h1><p>Every letter found in your documents</p></div>', unsafe_allow_html=True)
     idx = build_index()
+    dv, stt = idx["drive"], idx["stats"]
+
+    c_find, c_ref = st.columns([4, 1])
+    find = c_find.text_input("Filter (number, subject, date, office)", placeholder="e.g. SPAD, 2024, Kavach", label_visibility="collapsed")
+    if c_ref.button("🔄 Refresh", key="refresh_letters"):
+        if dv.get("mode") == "public":
+            shutil.rmtree(DRIVE_PUB, ignore_errors=True)
+        build_index.clear()
+        st.rerun()
+
     L = sorted(idx["letters"], key=lambda l: l["date"] or "", reverse=True)
     if not L:
-        dv, stt = idx["drive"], idx["stats"]
-        st.warning("No letters found yet. Here is why:")
+        st.warning("No letters found yet. Here's why:")
         if not dv["enabled"]:
             st.write("☁️ **Drive:** not connected - `GDRIVE_FOLDER_ID` is missing in Secrets (or the app hasn't reloaded since you added it).")
         elif dv["error"]:
@@ -697,13 +791,8 @@ def letters_page():
         except Exception:
             names = []
         st.write("🔑 **Secret names found** (values hidden):", names or "none")
-        if st.button("🔄 Sync / reload documents", key="sync_main"):
-            if dv.get("mode") == "public":
-                shutil.rmtree(DRIVE_PUB, ignore_errors=True)
-            build_index.clear()
-            st.rerun()
         return
-    find = st.text_input("Filter (number, subject, date, office)", placeholder="e.g. SPAD, 2024, Kavach")
+
     rows = [{"Letter No": l["no"] or "—", "Date": l["date"] or "—", "Subject": l["subject"] or "(not detected)",
              "Issued by": l["issuer"] or "—", "Pages": f"{l['page_start']}-{l['page_end']}", "File": l["source"]} for l in L]
     df = pd.DataFrame(rows)
@@ -712,25 +801,42 @@ def letters_page():
     st.caption(f"{len(df)} of {len(L)} letters")
     st.dataframe(df, use_container_width=True, hide_index=True)
 
-    st.markdown("### ✨ Summarize a letter & recommend action")
+    st.markdown("### ✨ View & Summarize a letter")
     opts = {f"{l['no'] or 'n/a'} | {l['date'] or 'n/a'} | {(l['subject'] or l['text'][:60])[:70]}": l for l in L}
     pick = st.selectbox("Choose letter", list(opts.keys()))
-    lang = st.radio("Summary language", ["English", "हिंदी", "मराठी"], horizontal=True)
     l = opts[pick]
-    if st.button("Summarize & recommend"):
+
+    render_document_viewer(l)
+
+    lang = st.radio("Summary language", ["English", "हिंदी", "मराठी"], horizontal=True)
+    if st.button("✨ Summarize & recommend"):
         body = " ".join(l["text"].split()[:5000])
         try:
-            with st.spinner("reading the letter…"):
-                st.markdown(generate(LETTER_SYSTEM, [{"role": "user", "content":
-                    f"Write the summary in {lang}.\n\nLETTER (file {l['source']}, pages {l['page_start']}-{l['page_end']}):\n{body}"}]))
+            with st.spinner("Reading the letter…"):
+                summary = generate(LETTER_SYSTEM, [{"role": "user", "content":
+                    f"Write the summary in {lang}.\n\nLETTER (file {l['source']}, pages {l['page_start']}-{l['page_end']}):\n{body}"}])
+                st.session_state["letter_summary"] = {"id": l["id"], "lang": lang, "text": summary}
         except Exception as e:
             st.error(f"Error: {e}")
+
+    saved = st.session_state.get("letter_summary")
+    if saved and saved.get("id") == l["id"]:
+        st.markdown(saved["text"])
+        wa_msg = (
+            f"*Safety Branch AI - Letter Summary*\n"
+            f"Letter No: {l['no'] or 'N/A'} | Date: {l['date'] or 'N/A'}\n"
+            f"Subject: {l['subject'] or 'N/A'}\n\n"
+            f"{saved['text']}"
+        )
+        wa_url = f"https://wa.me/?text={quote_plus(wa_msg)}"
+        st.link_button("💬 Share summary via WhatsApp", wa_url)
+
     with st.expander("View extracted text"):
         st.text(l["text"][:6000])
 
 
 def news_page():
-    st.markdown('<div class="hero"><h1>Rail News</h1><p>live + past headlines · Solapur division first</p></div>', unsafe_allow_html=True)
+    st.markdown('<div class="hero"><h1>Rail News</h1><p>Live + past headlines · Solapur Division first</p></div>', unsafe_allow_html=True)
     c1, c2 = st.columns(2)
     topic = c1.selectbox("Topic", list(NEWS_TOPICS.keys()), index=0)
     lang = c2.selectbox("Language", list(NEWS_LANGS.keys()), index=0)
@@ -751,7 +857,7 @@ def news_page():
             st.markdown('<div class="spot"><b>📍 Solapur Division spotlight</b> · last 30 days</div>', unsafe_allow_html=True)
             news_cards(sp)
     try:
-        with st.spinner("fetching headlines…"):
+        with st.spinner("Fetching headlines…"):
             items = fetch_news(NEWS_TOPICS[topic], days=days, after=after, before=before, lang=lang)
     except Exception as e:
         st.error(f"Couldn't fetch news: {e}")
@@ -763,7 +869,7 @@ def news_page():
     if st.button("✨ Summarize these headlines"):
         ctx = "\n".join(f"[{i}] {n['title']} ({n['source']}, {fmt_when(n['when'])})" for i, n in enumerate(items[:15], 1))
         try:
-            with st.spinner("summarizing…"):
+            with st.spinner("Summarizing…"):
                 st.markdown(generate(NEWS_SYSTEM, [{"role": "user", "content": f"NEWS HEADLINES ({topic}):\n{ctx}\n\nSummarize the key developments."}]))
         except Exception as e:
             st.error(f"Error: {e}")
@@ -773,10 +879,26 @@ def news_page():
 
 # ---------------- main ----------------
 if check_password():
+    with st.sidebar:
+        st.markdown("### 🚆 Safety Branch AI")
+        uploaded = st.file_uploader("📤 Upload documents", type=["pdf", "docx", "txt", "md"], accept_multiple_files=True)
+        if uploaded:
+            os.makedirs(UPLOAD_DIR, exist_ok=True)
+            changed = False
+            for uf in uploaded:
+                dest = os.path.join(UPLOAD_DIR, uf.name)
+                data = uf.getvalue()
+                if not os.path.exists(dest) or os.path.getsize(dest) != len(data):
+                    with open(dest, "wb") as fh:
+                        fh.write(data)
+                    changed = True
+            if changed:
+                build_index.clear()
+                st.rerun()
+
     idx = build_index()
     stt = idx["stats"]
     with st.sidebar:
-        st.markdown("### 🚆 Safety Branch AI")
         if idx["letters"]:
             st.markdown(f'<span class="pill ok">📑 {len(idx["letters"])} letters · {len(idx["chunks"])} passages</span>', unsafe_allow_html=True)
         else:
@@ -812,6 +934,7 @@ if check_password():
             st.write("GDRIVE_FOLDER_ID set:", bool(cfg("GDRIVE_FOLDER_ID")))
             st.write("Drive mode:", dv.get("mode") or "off")
             st.write("Files in documents/ folder:", len([f for f in glob.glob(os.path.join(DOC_DIR, "**", "*"), recursive=True) if os.path.isfile(f)]))
+            st.write("Uploaded files:", len([f for f in glob.glob(os.path.join(UPLOAD_DIR, "*")) if os.path.isfile(f)]))
             st.write("OCR available:", stt["ocr_ok"])
         if st.button("🧹 Clear chat"):
             st.session_state.history = []
