@@ -681,7 +681,27 @@ def letters_page():
     idx = build_index()
     L = sorted(idx["letters"], key=lambda l: l["date"] or "", reverse=True)
     if not L:
-        st.info("No letters found yet. Put your PDF in the Google Drive folder (or the documents/ folder) and press Sync.")
+        dv, stt = idx["drive"], idx["stats"]
+        st.warning("No letters found yet. Here is why:")
+        if not dv["enabled"]:
+            st.write("☁️ **Drive:** not connected - `GDRIVE_FOLDER_ID` is missing in Secrets (or the app hasn't reloaded since you added it).")
+        elif dv["error"]:
+            st.write(f"☁️ **Drive:** sync failed - {dv['error']}")
+        else:
+            st.write(f"☁️ **Drive ({dv.get('mode')}):** {dv['files']} file(s) downloaded.")
+        st.write(f"📄 **Scanned/unreadable pages:** {stt['unread']} · **OCR available:** {stt['ocr_ok']}")
+        if dv["enabled"] and not dv["error"] and dv["files"] and stt["unread"]:
+            st.info("Files were downloaded but their pages are images and OCR isn't working. Make sure packages.txt is in the repo (top level) and redeploy, or upload text-searchable PDFs.")
+        try:
+            names = list(st.secrets.keys())
+        except Exception:
+            names = []
+        st.write("🔑 **Secret names found** (values hidden):", names or "none")
+        if st.button("🔄 Sync / reload documents", key="sync_main"):
+            if dv.get("mode") == "public":
+                shutil.rmtree(DRIVE_PUB, ignore_errors=True)
+            build_index.clear()
+            st.rerun()
         return
     find = st.text_input("Filter (number, subject, date, office)", placeholder="e.g. SPAD, 2024, Kavach")
     rows = [{"Letter No": l["no"] or "—", "Date": l["date"] or "—", "Subject": l["subject"] or "(not detected)",
