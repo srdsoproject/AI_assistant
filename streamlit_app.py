@@ -5,7 +5,8 @@ Flow for every question:
   small talk     -> normal chat
   otherwise      -> 1) search YOUR letters/documents (local, Drive & uploaded)  2) if not found -> search the internet
 """
-import os, re, io, glob, json, shutil, zipfile, tempfile, datetime as dt
+import os, re, io, glob, json, time, shutil, hashlib, zipfile, tempfile, threading, datetime as dt
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import xml.etree.ElementTree as ET
 from urllib.parse import urlencode, quote_plus
 from email.utils import parsedate_to_datetime
@@ -18,6 +19,8 @@ st.set_page_config(page_title="Safety Branch AI", page_icon="🚆", layout="cent
 
 DOC_DIR = os.path.join(os.path.dirname(__file__), "documents")
 UPLOAD_DIR = os.path.join(tempfile.gettempdir(), "safety_uploaded_docs")
+INDEX_CACHE_DIR = os.path.join(tempfile.gettempdir(), "safety_index_cache")
+DRIVE_SYNC_TTL = 300  # seconds to skip redundant Drive API checks on quick reloads
 TOP_K, MIN_SCORE, MAX_OCR_PAGES = 6, 0.06, 400
 
 
@@ -305,9 +308,24 @@ def _sync_public(folder):
                 "error": f"{str(e)[:250]} - check the folder is shared as 'Anyone with the link - Viewer'."}
 
 
+def clear_drive_sync_cache():
+    sync_stamp = os.path.join(DRIVE_DIR, "_last_sync.json")
+    if os.path.exists(sync_stamp):
+        os.remove(sync_stamp)
+
+
 def sync_drive():
     """Download new/changed PDF, DOCX, TXT, MD and Google Docs from the Drive folder. Returns a status dict."""
     folder = cfg("GDRIVE_FOLDER_ID")
+    os.makedirs(DRIVE_DIR, exist_ok=True)
+    sync_stamp = os.path.join(DRIVE_DIR, "_last_sync.json")
+    if folder and os.path.exists(sync_stamp):
+        try:
+            st_data = json.load(open(sync_stamp))
+            if st_data.get("folder") == folder and (time.time() - st_data.get("ts", 0)) < DRIVE_SYNC_TTL:
+                return st_data.get("status", {"enabled": True, "files": 0, "error": None, "mode": st_data.get("mode")})
+        except Exception:
+            pass
     try:
         has_creds = "gcp_service_account" in st.secrets
     except Exception:
@@ -343,7 +361,7 @@ def sync_drive():
             req = (svc.files().export_media(fileId=f["id"], mimeType="application/pdf") if export
                    else svc.files().get_media(fileId=f["id"], supportsAllDrives=True))
             buf, done = io.BytesIO(), False
-            dl = MediaIoBaseDownload(buf, req)
+            dl = MediaIoBaseDownload(buf, req, chunksize=5 * 1024 * 1024)
             while not done:
                 _, done = dl.next_chunk()
             with open(local, "wb") as fh:
@@ -352,7 +370,10 @@ def sync_drive():
             n += 1
         with open(mpath, "w") as fh:
             json.dump(manifest, fh)
-        return {"enabled": True, "files": n, "error": None, "mode": "private"}
+        status = {"enabled": True, "files": n, "error": None, "mode": "private"}
+        with open(sync_stamp, "w") as fh:
+            json.dump({"folder": folder, "ts": time.time(), "mode": "private", "status": status}, fh)
+        return status
     except Exception as e:
         return {"enabled": True, "files": 0, "error": str(e)[:300], "mode": "private"}
 
@@ -377,7 +398,7 @@ def read_pdf_pages(path, stats):
                 try:
                     import pypdfium2 as pdfium, pytesseract
                     pdf = pdf or pdfium.PdfDocument(path)
-                    img = pdf[i - 1].render(scale=2).to_pil()
+                    img = pdf[i - 1].render(scale=1.5).to_pil()
                     try:
                         text = pytesseract.image_to_string(img, lang="eng+hin+mar")
                     except Exception:
@@ -400,17 +421,43 @@ def read_other(path):
         return [(1, f.read())]
 
 
-@st.cache_resource(show_spinner="Syncing Drive & reading your letters… (scanned PDFs take longer)")
+def _parse_file_cached(path, name, ext, stats, lock):
+    os.makedirs(INDEX_CACHE_DIR, exist_ok=True)
+    st_info = os.stat(path)
+    sig = f"{path}|{st_info.st_mtime_ns}|{st_info.st_size}"
+    cpath = os.path.join(INDEX_CACHE_DIR, hashlib.md5(sig.encode()).hexdigest() + ".json")
+    if os.path.exists(cpath):
+        try:
+            with open(cpath, "r", encoding="utf-8") as fh:
+                pages = [tuple(x) for x in json.load(fh)]
+            return split_letters(pages, name, path=path)
+        except Exception:
+            pass
+
+    local_stats = {"ocr_ok": stats["ocr_ok"], "ocr_done": 0, "unread": 0}
+    pages = read_pdf_pages(path, local_stats) if ext == "pdf" else read_other(path)
+    with lock:
+        stats["ocr_done"] += local_stats["ocr_done"]
+        stats["unread"] += local_stats["unread"]
+    try:
+        with open(cpath, "w", encoding="utf-8") as fh:
+            json.dump([[pno, txt] for pno, txt in pages], fh)
+    except Exception:
+        pass
+    return split_letters(pages, name, path=path)
+
+
+@st.cache_resource(show_spinner="Syncing Drive & loading documents…")
 def build_index():
     drive = sync_drive()
     stats = {"ocr_ok": ocr_available(), "ocr_done": 0, "unread": 0}
-    letters, files = [], []
+    letters, files, targets = [], [], []
     paths = []
     for root in (DOC_DIR, DRIVE_DIR, UPLOAD_DIR):
         if os.path.exists(root):
             paths += sorted(glob.glob(os.path.join(root, "**", "*"), recursive=True))
     for path in paths:
-        if not os.path.isfile(path) or path.endswith("README.txt"):
+        if not os.path.isfile(path) or path.endswith("README.txt") or os.path.basename(path).startswith("_"):
             continue
         ext = path.lower().rsplit(".", 1)[-1]
         if ext not in ("pdf", "docx", "txt", "md"):
@@ -419,11 +466,18 @@ def build_index():
         if path.startswith(DRIVE_SA):
             name = name[7:]                      # drop the id prefix added when downloading
         files.append({"name": name, "path": path})
-        try:
-            pages = read_pdf_pages(path, stats) if ext == "pdf" else read_other(path)
-            letters += split_letters(pages, name, path=path)
-        except Exception as e:
-            print(f"Could not read {path}: {e}")
+        targets.append((path, name, ext))
+
+    lock = threading.Lock()
+    if targets:
+        workers = min(4, len(targets))
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futs = [pool.submit(_parse_file_cached, p, n, e, stats, lock) for p, n, e in targets]
+            for fut in as_completed(futs):
+                try:
+                    letters += fut.result()
+                except Exception as e:
+                    print(f"Could not read file: {e}")
     chunks = chunk_letters(letters)
     vec = matrix = None
     if chunks:
@@ -730,12 +784,29 @@ def pick_days(q):
     return 7
 
 
+GENERAL_CHAT_RE = re.compile(
+    r"\b(draft|write|compose|rewrite|translate|explain|summarize|idea|ideas|slogan|poem|story|essay|"
+    r"email|message|speech|welcome|congratulat|advice|suggest|help me|how are you|tell me about|"
+    r"what do you think|joke|grammar|correct this|improve this)\b",
+    re.I,
+)
+DOC_INTENT_RE = re.compile(
+    r"\b(letter|letters|circular|order|notification|document|documents|file|files|pdf|docx|upload|uploaded|"
+    r"no\.?|dated|spad|kavach|g&sr|rule|rules|manual|sop|policy|guideline|directive|board|division|"
+    r"which letter|find|search|show me)\b|पत्र|परिपत्रक|संरक्षा|नियम",
+    re.I,
+)
+
+
 # ---------------- answer pipeline ----------------
-def answer(question, history):
+def answer(question, history, chat_mode="Auto (Letters + Chat + Web)"):
     """Returns (text, sources, mode, files); mode in news | doc | web | chat."""
     hist = [{"role": m["role"], "content": m["content"]} for m in history[-8:]]
 
-    if NEWS_WORDS.search(question):
+    if chat_mode == "💬 General Chat only":
+        return generate(CHAT_SYSTEM, hist + [{"role": "user", "content": question}]), [], "chat", []
+
+    if NEWS_WORDS.search(question) and chat_mode != "📚 Letters only":
         topic, days = pick_topic(question), pick_days(question)
         try:
             items = fetch_news(NEWS_TOPICS[topic], days=days)[:12] or fetch_news(NEWS_TOPICS[topic], days=365)[:12]
@@ -746,7 +817,9 @@ def answer(question, history):
             text = generate(NEWS_SYSTEM, hist + [{"role": "user", "content": f"NEWS HEADLINES ({topic}):\n{ctx}\n\nQUESTION: {question}"}])
             return text, [f"[{i}] [{n['title']}]({n['link']}) - {n['source']}, {fmt_when(n['when'])}" for i, n in enumerate(items, 1)], "news", []
 
-    if SMALLTALK.match(question):
+    if chat_mode != "📚 Letters only" and (
+        SMALLTALK.match(question) or (GENERAL_CHAT_RE.search(question) and not DOC_INTENT_RE.search(question))
+    ):
         return generate(CHAT_SYSTEM, hist + [{"role": "user", "content": question}]), [], "chat", []
 
     ctx = retrieve(question)                                   # 1) department & uploaded letters
@@ -757,16 +830,21 @@ def answer(question, history):
         if "NOT_FOUND_IN_DOCUMENTS" not in text:
             return text, [f"[{i}] {label(c)}" for i, c in enumerate(ctx, 1)], "doc", matched_files
 
-    if matched_files:
+    if matched_files and (DOC_INTENT_RE.search(question) or chat_mode == "📚 Letters only"):
         file_list = "\n".join(f"- **{f['name']}**" + (f" (Letter No. {f['no']}, {f['date']})" if f.get("no") else "") for f in matched_files)
         return f"📑 I found relevant document(s) matching your query:\n\n{file_list}\n\nDownload them below or ask a specific question about their contents.", [], "doc", matched_files
 
-    try:                                                        # 2) internet
-        text, srcs = web_answer(question, hist)
-        return text, srcs, "web", []
-    except Exception as e:
-        text = generate(CHAT_SYSTEM, hist + [{"role": "user", "content": question}])
-        return text + f"\n\n_(Letters had no match and web search failed: {e})_", [], "chat", []
+    if chat_mode == "📚 Letters only":
+        return "📭 Not found in your department or uploaded letters. Switch to **Auto** or **General Chat** to ask freely or search the web.", [], "doc", []
+
+    if DOC_INTENT_RE.search(question):
+        try:                                                    # 2) internet for rule/policy lookups
+            text, srcs = web_answer(question, hist)
+            return text, srcs, "web", []
+        except Exception:
+            pass
+
+    return generate(CHAT_SYSTEM, hist + [{"role": "user", "content": question}]), [], "chat", []
 
 
 def render_msg(m, msg_idx=0):
@@ -834,7 +912,14 @@ def render_document_viewer(letter, key_suffix="", idx_files=None):
 
 # ---------------- pages ----------------
 def chat_page():
-    st.markdown('<div class="hero"><h1>Safety Branch AI</h1><p>Letters first, internet if needed · हिंदी / English / मराठी</p></div>', unsafe_allow_html=True)
+    st.markdown('<div class="hero"><h1>Safety Branch AI</h1><p>Letters, general chat & web · हिंदी / English / मराठी</p></div>', unsafe_allow_html=True)
+    chat_mode = st.radio(
+        "Chat mode",
+        ["Auto (Letters + Chat + Web)", "💬 General Chat only", "📚 Letters only"],
+        horizontal=True,
+        label_visibility="collapsed",
+        key="chat_mode",
+    )
     st.session_state.setdefault("history", [])
     if not st.session_state.history:
         st.markdown("**Try one:**")
@@ -853,7 +938,7 @@ def chat_page():
         with st.chat_message("assistant"):
             with st.spinner("Checking your letters…"):
                 try:
-                    a, srcs, mode, files = answer(q, st.session_state.history)
+                    a, srcs, mode, files = answer(q, st.session_state.history, chat_mode=chat_mode)
                 except Exception as e:
                     a, srcs, mode, files = f"⚠️ Error: {e}\n\nIf it names a provider, check that key/model name in Secrets.", [], None, []
             msg = {"role": "assistant", "content": a, "sources": srcs, "mode": mode, "files": files}
@@ -872,6 +957,7 @@ def letters_page():
     if c_ref.button("🔄 Refresh", key="refresh_letters"):
         if dv.get("mode") == "public":
             shutil.rmtree(DRIVE_PUB, ignore_errors=True)
+        clear_drive_sync_cache()
         build_index.clear()
         st.rerun()
 
@@ -1149,6 +1235,7 @@ if check_password():
         if st.button("🔄 Sync / reload documents"):
             if dv.get("mode") == "public":
                 shutil.rmtree(DRIVE_PUB, ignore_errors=True)   # force a fresh download
+            clear_drive_sync_cache()
             build_index.clear()
             st.rerun()
         with st.expander("🔧 Diagnostics"):
