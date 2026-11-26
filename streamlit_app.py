@@ -773,6 +773,9 @@ if check_password():
         elif dv["enabled"]:
             kind = "public link" if dv.get("mode") == "public" else "private"
             st.markdown(f'<span class="pill ok">☁️ Drive ({kind}): {dv["files"]} file(s)</span>', unsafe_allow_html=True)
+        else:
+            st.markdown('<span class="pill warn">☁️ Drive not connected</span>', unsafe_allow_html=True)
+            st.caption("GDRIVE_FOLDER_ID not found in Secrets. Add it, save, then press Sync / reload.")
         st.markdown(f'<span class="pill">⚡ {PROVIDER} → {FALLBACK or "none"}</span>', unsafe_allow_html=True)
         st.write("")
         if st.button("🔄 Sync / reload documents"):
@@ -780,6 +783,16 @@ if check_password():
                 shutil.rmtree(DRIVE_PUB, ignore_errors=True)   # force a fresh download
             build_index.clear()
             st.rerun()
+        with st.expander("🔧 Diagnostics"):
+            try:
+                names = list(st.secrets.keys())
+            except Exception:
+                names = []
+            st.write("Secret names found (values hidden):", names or "none")
+            st.write("GDRIVE_FOLDER_ID set:", bool(cfg("GDRIVE_FOLDER_ID")))
+            st.write("Drive mode:", dv.get("mode") or "off")
+            st.write("Files in documents/ folder:", len([f for f in glob.glob(os.path.join(DOC_DIR, "**", "*"), recursive=True) if os.path.isfile(f)]))
+            st.write("OCR available:", stt["ocr_ok"])
         if st.button("🧹 Clear chat"):
             st.session_state.history = []
             st.rerun()
