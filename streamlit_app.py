@@ -3,7 +3,11 @@ Safety Branch AI Assistant - Streamlit (Groq + Gemini fallback)
 - Chats normally (hi/hello/anything) even with NO documents.
 - When documents are loaded, answers from them with citations.
 """
-import os, re, glob
+import os, re, glob, datetime as dt
+import xml.etree.ElementTree as ET
+from urllib.parse import urlencode
+from email.utils import parsedate_to_datetime
+import requests
 import streamlit as st
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
@@ -50,8 +54,8 @@ limits, SOP steps or dates, do NOT invent them - give general guidance only, say
 from the department's documents, and tell them to verify with the official manual/circular.
 Never fake citations."""
 
-SUGGESTIONS = ["👋 Hi, what can you do?", "🚨 What to do after a derailment?",
-               "📝 Help me draft a safety circular", "🔍 Explain SPAD in simple words"]
+SUGGESTIONS = ["📰 Latest Solapur division news", "👋 Hi, what can you do?", "🚨 What to do after a derailment?",
+               "📝 Help me draft a safety circular"]
 
 # ---------------- styling ----------------
 CSS = """
@@ -91,6 +95,15 @@ header[data-testid="stHeader"], footer, #MainMenu {visibility: hidden; height: 0
   box-shadow: 0 6px 20px #b6ff3c22;}
 [data-testid="stSidebar"] {background:#0d0e1acc; border-right:1px solid #ffffff14;}
 .streamlit-expanderHeader, [data-testid="stExpander"] {border-radius: 12px; border-color:#ffffff1a;}
+.newscard {background:#ffffff0a; border:1px solid #ffffff14; border-radius:16px; padding:12px 16px;
+  margin-bottom:10px; backdrop-filter: blur(10px); transition: all .2s;}
+.newscard:hover {border-color:#00e5ff66; transform: translateY(-2px);}
+.newscard a {color:#eceefc; text-decoration:none; font-weight:500; line-height:1.35;}
+.newscard a:hover {color:#b6ff3c;}
+.newsmeta {color:#9aa0c3; font-size:.75rem; margin-top:5px;}
+.spot {border:1px solid #b6ff3c55; background:linear-gradient(135deg,#b6ff3c12,#00e5ff10); border-radius:18px;
+  padding:6px 16px 2px; margin-bottom:14px;}
+div[role="radiogroup"] {gap: .4rem; flex-wrap: wrap;}
 .foot {text-align:center; color:#6b7094; font-size:.72rem; margin-top: 10px;}
 </style>
 """
@@ -233,13 +246,124 @@ def generate(system, msgs):
     raise RuntimeError(" | ".join(errors) or "No valid LLM provider configured")
 
 
+# ---------------- NEWS ----------------
+IST = dt.timezone(dt.timedelta(hours=5, minutes=30))
+NEWS_TOPICS = {
+    "📍 Solapur Division": '("Solapur division" OR "Solapur railway" OR "Solapur railway station" OR "Solapur Central Railway")',
+    "🚆 Central Railway": '"Central Railway" (Mumbai OR Pune OR Solapur OR Nagpur OR Bhusawal)',
+    "🇮🇳 Indian Railways": '"Indian Railways"',
+    "🛡️ Railway Safety": '("railway safety" OR "train accident" OR derailment OR Kavach) India',
+}
+NEWS_LANGS = {"English": ("en-IN", "IN:en"), "हिंदी": ("hi", "IN:hi"), "मराठी": ("mr", "IN:mr")}
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def fetch_news(query, days=None, after=None, before=None, lang="English", limit=30):
+    """Google News RSS (free, no key). Returns list of dicts, newest first."""
+    q = query
+    if days:
+        q += f" when:{days}d"
+    if after:
+        q += f" after:{after}"
+    if before:
+        q += f" before:{before}"
+    hl, ceid = NEWS_LANGS.get(lang, NEWS_LANGS["English"])
+    url = "https://news.google.com/rss/search?" + urlencode({"q": q, "hl": hl, "gl": "IN", "ceid": ceid})
+    r = requests.get(url, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
+    r.raise_for_status()
+    items, seen = [], set()
+    for it in ET.fromstring(r.content).iter("item"):
+        title, link = it.findtext("title", ""), it.findtext("link", "")
+        src_el = it.find("source")
+        src = src_el.text if src_el is not None and src_el.text else ""
+        if src and title.endswith(" - " + src):
+            title = title[: -len(src) - 3]
+        key = title.lower()[:70]
+        if not title or key in seen:
+            continue
+        seen.add(key)
+        try:
+            when = parsedate_to_datetime(it.findtext("pubDate", "")).astimezone(IST)
+        except Exception:
+            when = None
+        items.append({"title": title, "link": link, "source": src, "when": when})
+    items.sort(key=lambda x: x["when"] or dt.datetime.min.replace(tzinfo=IST), reverse=True)
+    return items[:limit]
+
+
+def fmt_when(d):
+    return d.strftime("%d %b %Y") if d else ""
+
+
+def news_cards(items):
+    for n in items:
+        st.markdown(
+            f'<div class="newscard"><a href="{n["link"]}" target="_blank">{n["title"]}</a>'
+            f'<div class="newsmeta">📰 {n["source"] or "news"} · {fmt_when(n["when"])}</div></div>',
+            unsafe_allow_html=True)
+
+
+NEWS_WORDS = re.compile(r"\b(news|latest|today|recent|recently|update|updates|headline|headlines|happening|"
+                        r"past news|old news|previous news)\b|खबर|समाचार|ताज़ा|ताजा|बातम्या|बातमी", re.I)
+
+
+def news_intent(q):
+    return bool(NEWS_WORDS.search(q))
+
+
+def pick_topic(q):
+    ql = q.lower()
+    if "solapur" in ql or "सोलापुर" in q or "सोलापूर" in q:
+        return "📍 Solapur Division"
+    if re.search(r"safety|accident|derail|kavach|collision|spad", ql):
+        return "🛡️ Railway Safety"
+    if "central railway" in ql or "मध्य रेल" in q or "मध्य रेल्वे" in q:
+        return "🚆 Central Railway"
+    return "🇮🇳 Indian Railways"
+
+
+def pick_days(q):
+    ql = q.lower()
+    if re.search(r"today|आज|आज की|24 hour", ql):
+        return 1
+    if re.search(r"year|past|old|previous|earlier|history|पिछले|मागील", ql):
+        return 365
+    if re.search(r"month|महीन|महिन", ql):
+        return 30
+    return 7
+
+
+NEWS_SYSTEM = """You are the Safety Branch Assistant for Indian Railways staff. You are given recent NEWS HEADLINES
+(numbered, with source and date). Summarize what is happening based ONLY on these headlines.
+Rules: cite headlines as [1], [2]; group related items; mention dates; never add details that are not in the
+headlines (you only see titles, not full articles) and say so if the user wants more detail - tell them to open the
+link. If the headlines don't answer the question, say that. Reply in the user's language, short and clear.
+Do not treat news as official instructions."""
+
+
 def answer(question, history):
-    """Returns (text, sources, mode) where mode is 'doc' or 'chat'."""
+    """Returns (text, sources, mode): mode is 'news', 'doc' or 'chat'."""
     hist = [{"role": m["role"], "content": m["content"]} for m in history[-8:]]
+
+    if news_intent(question):
+        topic, days = pick_topic(question), pick_days(question)
+        try:
+            items = fetch_news(NEWS_TOPICS[topic], days=days)[:12]
+        except Exception as e:
+            return f"⚠️ Couldn't fetch news right now ({e}). Try again in a bit.", [], "chat"
+        if not items and days < 365:
+            items = fetch_news(NEWS_TOPICS[topic], days=365)[:12]
+        if items:
+            ctx = "\n".join(f"[{i}] {n['title']} ({n['source']}, {fmt_when(n['when'])})"
+                            for i, n in enumerate(items, 1))
+            msgs = hist + [{"role": "user", "content": f"NEWS HEADLINES ({topic}):\n{ctx}\n\nQUESTION: {question}"}]
+            srcs = [f"[{i}] [{n['title']}]({n['link']}) - {n['source']}, {fmt_when(n['when'])}"
+                    for i, n in enumerate(items, 1)]
+            return generate(NEWS_SYSTEM, msgs), srcs, "news"
+
     ctx = retrieve(question)
     if ctx:
-        context = "\n\n".join(f"[{i}] ({c['source']} {c['page']})\n{c['text']}"
-                              for i, c in enumerate(ctx, 1))
+        context = "\n\n".join(f"[{i}] ({c['source']} {c['page']})\n{c['text']}" for i, c in enumerate(ctx, 1))
         msgs = hist + [{"role": "user", "content": f"CONTEXT:\n{context}\n\nQUESTION: {question}"}]
         srcs = [f"[{i}] {c['source']} {c['page']}".strip() for i, c in enumerate(ctx, 1)]
         return generate(RAG_SYSTEM, msgs), srcs, "doc"
@@ -248,8 +372,8 @@ def answer(question, history):
 
 def render_msg(m):
     if m["role"] == "assistant" and m.get("mode"):
-        label = "📚 from documents" if m["mode"] == "doc" else "💬 general chat"
-        cls = "doc" if m["mode"] == "doc" else "chat"
+        label = {"doc": "📚 from documents", "news": "📰 live news"}.get(m["mode"], "💬 general chat")
+        cls = "doc" if m["mode"] in ("doc", "news") else "chat"
         st.markdown(f'<span class="badge {cls}">{label}</span>', unsafe_allow_html=True)
     st.markdown(m["content"])
     if m.get("sources"):
@@ -258,39 +382,70 @@ def render_msg(m):
 
 
 # ---------------- UI ----------------
-if check_password():
-    chunks, _, _ = build_index()
-    n_files = len({c["source"] for c in chunks})
-
-    with st.sidebar:
-        st.markdown("### 🚆 Safety Branch AI")
-        if chunks:
-            st.markdown(f'<span class="pill ok">📚 {n_files} doc(s) · {len(chunks)} passages</span>',
-                        unsafe_allow_html=True)
-        else:
-            st.markdown('<span class="pill warn">📭 no documents yet · chat mode</span>',
-                        unsafe_allow_html=True)
-        st.markdown(f'<span class="pill">⚡ {PROVIDER} → {FALLBACK or "none"}</span>',
-                    unsafe_allow_html=True)
-        st.write("")
-        if st.button("🧹 Clear chat"):
-            st.session_state.history = []
-            st.rerun()
-        st.caption("Add PDFs/DOCX/TXT to the documents/ folder on GitHub to unlock cited answers.")
-
-    st.markdown('<div class="hero"><h1>Safety Branch AI</h1>'
-                '<p>ask anything · rules, SOPs, drafts, or just vibes · हिंदी / English</p></div>',
+def news_page():
+    st.markdown('<div class="hero"><h1>Rail News</h1><p>live + past headlines · Solapur division first</p></div>',
                 unsafe_allow_html=True)
+    c1, c2 = st.columns(2)
+    topic = c1.selectbox("Topic", list(NEWS_TOPICS.keys()), index=0)
+    lang = c2.selectbox("Language", list(NEWS_LANGS.keys()), index=0)
+    rng = st.radio("Time range", ["24 hours", "7 days", "30 days", "1 year", "Custom dates"],
+                   index=1, horizontal=True)
+    days = after = before = None
+    if rng == "Custom dates":
+        d1, d2 = st.columns(2)
+        a_ = d1.date_input("From", dt.date.today() - dt.timedelta(days=180))
+        b_ = d2.date_input("To", dt.date.today())
+        after, before = a_.isoformat(), b_.isoformat()
+    else:
+        days = {"24 hours": 1, "7 days": 7, "30 days": 30, "1 year": 365}[rng]
 
+    # Solapur spotlight (always visible unless Solapur is already the selected topic)
+    if topic != "📍 Solapur Division":
+        try:
+            sp = fetch_news(NEWS_TOPICS["📍 Solapur Division"], days=30, lang=lang)[:4]
+        except Exception:
+            sp = []
+        if sp:
+            st.markdown('<div class="spot"><b>📍 Solapur Division spotlight</b> · last 30 days</div>',
+                        unsafe_allow_html=True)
+            news_cards(sp)
+
+    try:
+        with st.spinner("fetching headlines…"):
+            items = fetch_news(NEWS_TOPICS[topic], days=days, after=after, before=before, lang=lang)
+    except Exception as e:
+        st.error(f"Couldn't fetch news: {e}")
+        return
+    st.markdown(f"**{topic}** · {len(items)} headlines")
+    if not items:
+        st.info("No headlines found for this range. Try a longer range or another language.")
+        return
+    if st.button("✨ Summarize these headlines"):
+        ctx = "\n".join(f"[{i}] {n['title']} ({n['source']}, {fmt_when(n['when'])})"
+                        for i, n in enumerate(items[:15], 1))
+        try:
+            with st.spinner("summarizing…"):
+                st.markdown(generate(NEWS_SYSTEM, [{"role": "user", "content":
+                            f"NEWS HEADLINES ({topic}):\n{ctx}\n\nGive a short summary of the key developments."}]))
+        except Exception as e:
+            st.error(f"Error: {e}")
+    news_cards(items)
+    st.caption("Headlines via Google News. Open the link for the full story. News is not official instructions.")
+
+
+def chat_page(chunks):
+    st.markdown('<div class="hero"><h1>Safety Branch AI</h1>'
+                '<p>ask anything · rules, SOPs, news, drafts, or just vibes · हिंदी / English / मराठी</p></div>',
+                unsafe_allow_html=True)
     if "history" not in st.session_state:
         st.session_state.history = []
 
     if not st.session_state.history:
         st.markdown("**Try one:**")
         cols = st.columns(2)
-        for i, s in enumerate(SUGGESTIONS):
-            if cols[i % 2].button(s, key=f"sug{i}"):
-                st.session_state.pending = s.split(" ", 1)[1]
+        for i, sg in enumerate(SUGGESTIONS):
+            if cols[i % 2].button(sg, key=f"sug{i}"):
+                st.session_state.pending = sg.split(" ", 1)[1]
                 st.rerun()
 
     for m in st.session_state.history:
@@ -310,6 +465,32 @@ if check_password():
             msg = {"role": "assistant", "content": a, "sources": srcs, "mode": mode}
             render_msg(msg)
         st.session_state.history += [{"role": "user", "content": q}, msg]
+
+
+if check_password():
+    chunks, _, _ = build_index()
+    n_files = len({c["source"] for c in chunks})
+
+    with st.sidebar:
+        st.markdown("### 🚆 Safety Branch AI")
+        if chunks:
+            st.markdown(f'<span class="pill ok">📚 {n_files} doc(s) · {len(chunks)} passages</span>',
+                        unsafe_allow_html=True)
+        else:
+            st.markdown('<span class="pill warn">📭 no documents yet · chat + news mode</span>',
+                        unsafe_allow_html=True)
+        st.markdown(f'<span class="pill">⚡ {PROVIDER} → {FALLBACK or "none"}</span>', unsafe_allow_html=True)
+        st.write("")
+        if st.button("🧹 Clear chat"):
+            st.session_state.history = []
+            st.rerun()
+        st.caption("Add PDFs/DOCX/TXT to the documents/ folder on GitHub to unlock cited answers.")
+
+    page = st.radio("page", ["💬 Chat", "📰 News"], horizontal=True, label_visibility="collapsed")
+    if page == "📰 News":
+        news_page()
+    else:
+        chat_page(chunks)
 
     st.markdown('<div class="foot">AI-generated. Verify with the latest official instructions before acting.</div>',
                 unsafe_allow_html=True)
