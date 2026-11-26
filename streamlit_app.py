@@ -25,8 +25,11 @@ def cfg(key, default=""):
 
 PROVIDER = cfg("LLM_PROVIDER", "groq").lower()
 FALLBACK = cfg("LLM_FALLBACK", "gemini").lower()
-GROQ_MODEL = cfg("GROQ_MODEL", "llama-3.3-70b-versatile")
-GEMINI_MODEL = cfg("GEMINI_MODEL", "gemini-2.5-flash")
+GROQ_MODEL = cfg("GROQ_MODEL", "openai/gpt-oss-120b")
+GEMINI_MODEL = cfg("GEMINI_MODEL", "gemini-3.8-flash")
+# backups tried automatically if the main model name is retired
+GROQ_BACKUPS = ["openai/gpt-oss-20b"]
+GEMINI_BACKUPS = ["gemini-flash-latest"]
 
 # ---------------- prompts ----------------
 RAG_SYSTEM = """You are the Safety Branch Assistant for Indian Railways officials and staff.
@@ -178,10 +181,20 @@ def _groq(system, msgs):
     if not key:
         raise RuntimeError("GROQ_API_KEY missing in Secrets")
     client = groq_client(key)
-    r = client.chat.completions.create(
-        model=GROQ_MODEL, temperature=0.4, max_tokens=1000,
-        messages=[{"role": "system", "content": system}] + msgs)
-    return r.choices[0].message.content
+    errs = []
+    for model in dict.fromkeys([GROQ_MODEL] + GROQ_BACKUPS):
+        try:
+            kw = {"reasoning_effort": "low"} if model.startswith("openai/gpt-oss") else {}
+            r = client.chat.completions.create(
+                model=model, temperature=0.4, max_tokens=2000,
+                messages=[{"role": "system", "content": system}] + msgs, **kw)
+            text = r.choices[0].message.content
+            if text:
+                return text
+            errs.append(f"{model}: empty reply")
+        except Exception as e:
+            errs.append(f"{model}: {e}")
+    raise RuntimeError("; ".join(errs))
 
 
 def _gemini(system, msgs):
@@ -192,11 +205,19 @@ def _gemini(system, msgs):
     client = gemini_client(key)
     contents = [types.Content(role="user" if m["role"] == "user" else "model",
                               parts=[types.Part(text=m["content"])]) for m in msgs]
-    r = client.models.generate_content(
-        model=GEMINI_MODEL, contents=contents,
-        config=types.GenerateContentConfig(system_instruction=system,
-                                           temperature=0.4, max_output_tokens=1000))
-    return r.text
+    errs = []
+    for model in dict.fromkeys([GEMINI_MODEL] + GEMINI_BACKUPS):
+        try:
+            r = client.models.generate_content(
+                model=model, contents=contents,
+                config=types.GenerateContentConfig(system_instruction=system,
+                                                   temperature=0.4, max_output_tokens=2000))
+            if r.text:
+                return r.text
+            errs.append(f"{model}: empty reply")
+        except Exception as e:
+            errs.append(f"{model}: {e}")
+    raise RuntimeError("; ".join(errs))
 
 
 def generate(system, msgs):
