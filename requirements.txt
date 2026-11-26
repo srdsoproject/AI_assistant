@@ -11,3 +11,4 @@ requests>=2.31
 pypdfium2>=4.30
 pytesseract>=0.3.10
 ddgs>=9.0
+gdown>=5.2
