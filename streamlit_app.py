@@ -161,20 +161,38 @@ def retrieve(query):
 
 
 # ---------------- LLMs ----------------
-def _groq(system, msgs):
+@st.cache_resource
+def groq_client(key):
     from groq import Groq
-    r = Groq(api_key=cfg("GROQ_API_KEY")).chat.completions.create(
+    return Groq(api_key=key)
+
+
+@st.cache_resource
+def gemini_client(key):
+    from google import genai
+    return genai.Client(api_key=key)
+
+
+def _groq(system, msgs):
+    key = cfg("GROQ_API_KEY")
+    if not key:
+        raise RuntimeError("GROQ_API_KEY missing in Secrets")
+    client = groq_client(key)
+    r = client.chat.completions.create(
         model=GROQ_MODEL, temperature=0.4, max_tokens=1000,
         messages=[{"role": "system", "content": system}] + msgs)
     return r.choices[0].message.content
 
 
 def _gemini(system, msgs):
-    from google import genai
     from google.genai import types
+    key = cfg("GEMINI_API_KEY")
+    if not key:
+        raise RuntimeError("GEMINI_API_KEY missing in Secrets")
+    client = gemini_client(key)
     contents = [types.Content(role="user" if m["role"] == "user" else "model",
                               parts=[types.Part(text=m["content"])]) for m in msgs]
-    r = genai.Client(api_key=cfg("GEMINI_API_KEY")).models.generate_content(
+    r = client.models.generate_content(
         model=GEMINI_MODEL, contents=contents,
         config=types.GenerateContentConfig(system_instruction=system,
                                            temperature=0.4, max_output_tokens=1000))
@@ -183,15 +201,15 @@ def _gemini(system, msgs):
 
 def generate(system, msgs):
     providers = {"groq": _groq, "gemini": _gemini}
-    last = None
+    errors = []
     for p in dict.fromkeys([PROVIDER, FALLBACK]):
         if p not in providers:
             continue
         try:
             return providers[p](system, msgs)
         except Exception as e:
-            last = e
-    raise last or RuntimeError("No valid LLM provider configured")
+            errors.append(f"{p}: {e}")
+    raise RuntimeError(" | ".join(errors) or "No valid LLM provider configured")
 
 
 def answer(question, history):
@@ -267,7 +285,7 @@ if check_password():
                 try:
                     a, srcs, mode = answer(q, st.session_state.history)
                 except Exception as e:
-                    a, srcs, mode = f"⚠️ Error: {e}\n\nCheck your API keys in Secrets.", [], None
+                    a, srcs, mode = f"⚠️ Error: {e}\n\nIf it names a provider, check that key/model name in Secrets.", [], None
             msg = {"role": "assistant", "content": a, "sources": srcs, "mode": mode}
             render_msg(msg)
         st.session_state.history += [{"role": "user", "content": q}, msg]
