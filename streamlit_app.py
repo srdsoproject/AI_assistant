@@ -244,6 +244,9 @@ def chunk_letters(letters, words=220, overlap=40):
 
 # ---------------- Google Drive (private folder via service account) ----------------
 DRIVE_DIR = os.path.join(tempfile.gettempdir(), "safety_drive_docs")
+DRIVE_SA = os.path.join(DRIVE_DIR, "private")   # service-account downloads
+DRIVE_PUB = os.path.join(DRIVE_DIR, "public")   # public-link downloads
+import shutil
 GDOC = "application/vnd.google-apps.document"
 
 
@@ -264,6 +267,23 @@ def _drive_list(svc, folder_id, depth=0):
             return files
 
 
+def _sync_public(folder):
+    """Simple mode: folder shared as 'Anyone with the link - Viewer'. No credentials needed."""
+    try:
+        import gdown
+        os.makedirs(DRIVE_PUB, exist_ok=True)
+        gdown.download_folder(id=folder, output=DRIVE_PUB, quiet=True, use_cookies=False,
+                              remaining_ok=True, resume=True)
+        n = sum(len(fs) for _, _, fs in os.walk(DRIVE_PUB))
+        if not n:
+            return {"enabled": True, "files": 0, "mode": "public",
+                    "error": "No files downloaded. Share the folder as 'Anyone with the link - Viewer' (or set up the private service-account mode)."}
+        return {"enabled": True, "files": n, "mode": "public", "error": None}
+    except Exception as e:
+        return {"enabled": True, "files": 0, "mode": "public",
+                "error": f"{str(e)[:250]} - check the folder is shared as 'Anyone with the link - Viewer'."}
+
+
 def sync_drive():
     """Download new/changed PDF, DOCX, TXT, MD and Google Docs from the Drive folder. Returns a status dict."""
     folder = cfg("GDRIVE_FOLDER_ID")
@@ -271,8 +291,10 @@ def sync_drive():
         has_creds = "gcp_service_account" in st.secrets
     except Exception:
         has_creds = False
-    if not folder or not has_creds:
-        return {"enabled": False, "files": 0, "error": None}
+    if not folder:
+        return {"enabled": False, "files": 0, "error": None, "mode": None}
+    if not has_creds:
+        return _sync_public(folder)
     try:
         from google.oauth2 import service_account
         from googleapiclient.discovery import build
@@ -282,8 +304,8 @@ def sync_drive():
         creds = service_account.Credentials.from_service_account_info(
             info, scopes=["https://www.googleapis.com/auth/drive.readonly"])
         svc = build("drive", "v3", credentials=creds, cache_discovery=False)
-        os.makedirs(DRIVE_DIR, exist_ok=True)
-        mpath = os.path.join(DRIVE_DIR, "_manifest.json")
+        os.makedirs(DRIVE_SA, exist_ok=True)
+        mpath = os.path.join(DRIVE_SA, "_manifest.json")
         manifest = json.load(open(mpath)) if os.path.exists(mpath) else {}
         n = 0
         for f in _drive_list(svc, folder):
@@ -293,7 +315,7 @@ def sync_drive():
                 continue
             if export and not name.lower().endswith(".pdf"):
                 name += ".pdf"
-            local = os.path.join(DRIVE_DIR, f"{f['id'][:6]}_{name}")
+            local = os.path.join(DRIVE_SA, f"{f['id'][:6]}_{name}")
             if manifest.get(f["id"]) == f["modifiedTime"] and os.path.exists(local):
                 n += 1
                 continue
@@ -309,9 +331,9 @@ def sync_drive():
             n += 1
         with open(mpath, "w") as fh:
             json.dump(manifest, fh)
-        return {"enabled": True, "files": n, "error": None}
+        return {"enabled": True, "files": n, "error": None, "mode": "private"}
     except Exception as e:
-        return {"enabled": True, "files": 0, "error": str(e)[:300]}
+        return {"enabled": True, "files": 0, "error": str(e)[:300], "mode": "private"}
 
 
 # ---------------- documents: read (with OCR fallback), split into letters, index ----------------
@@ -372,7 +394,7 @@ def build_index():
         if ext not in ("pdf", "docx", "txt", "md"):
             continue
         name = os.path.basename(path)
-        if path.startswith(DRIVE_DIR):
+        if path.startswith(DRIVE_SA):
             name = name[7:]                      # drop the id prefix added when downloading
         try:
             pages = read_pdf_pages(path, stats) if ext == "pdf" else read_other(path)
@@ -749,10 +771,13 @@ if check_password():
             st.markdown('<span class="pill warn">☁️ Drive sync failed</span>', unsafe_allow_html=True)
             st.caption(dv["error"])
         elif dv["enabled"]:
-            st.markdown(f'<span class="pill ok">☁️ Drive: {dv["files"]} file(s) synced</span>', unsafe_allow_html=True)
+            kind = "public link" if dv.get("mode") == "public" else "private"
+            st.markdown(f'<span class="pill ok">☁️ Drive ({kind}): {dv["files"]} file(s)</span>', unsafe_allow_html=True)
         st.markdown(f'<span class="pill">⚡ {PROVIDER} → {FALLBACK or "none"}</span>', unsafe_allow_html=True)
         st.write("")
-        if dv["enabled"] and st.button("🔄 Sync Drive now"):
+        if st.button("🔄 Sync / reload documents"):
+            if dv.get("mode") == "public":
+                shutil.rmtree(DRIVE_PUB, ignore_errors=True)   # force a fresh download
             build_index.clear()
             st.rerun()
         if st.button("🧹 Clear chat"):
