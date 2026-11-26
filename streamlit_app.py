@@ -471,17 +471,69 @@ def find_relevant_files(query, chunks=None, limit=5):
     return matched[:limit]
 
 
+def guess_mime(name):
+    ext = (name or "").lower().rsplit(".", 1)[-1]
+    return {
+        "pdf": "application/pdf",
+        "docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "txt": "text/plain",
+        "md": "text/markdown",
+        "zip": "application/zip",
+    }.get(ext, "application/octet-stream")
+
+
+def resolve_letter_path(letter, idx_files=None):
+    path = letter.get("path", "")
+    if path and os.path.exists(path):
+        return path
+    src_name = letter.get("source", "")
+    for f in (idx_files or []):
+        if f.get("name") == src_name and f.get("path") and os.path.exists(f["path"]):
+            return f["path"]
+    return ""
+
+
+def get_letter_download(letter, idx_files=None):
+    """Return (bytes, filename, mime) for a specific letter, extracting its pages if part of a multi-letter PDF."""
+    path = resolve_letter_path(letter, idx_files)
+    name = letter.get("source", "document") or os.path.basename(path)
+    if not path:
+        return None, None, None
+    if path.lower().endswith(".pdf"):
+        try:
+            from pypdf import PdfReader, PdfWriter
+            reader = PdfReader(path)
+            total = len(reader.pages)
+            ps = max(1, int(letter.get("page_start") or 1))
+            pe = min(total, int(letter.get("page_end") or total))
+            if ps <= pe and (ps > 1 or pe < total):
+                writer = PdfWriter()
+                for pg in range(ps - 1, pe):
+                    writer.add_page(reader.pages[pg])
+                out = io.BytesIO()
+                writer.write(out)
+                tag = re.sub(r"[^\w.-]+", "_", letter.get("no") or f"p{ps}-{pe}").strip("_")
+                dl_name = f"{tag}_{name}" if tag else name
+                return out.getvalue(), dl_name, "application/pdf"
+        except Exception:
+            pass
+    with open(path, "rb") as fh:
+        return fh.read(), name, guess_mime(name)
+
+
 def build_zip_bytes(file_items):
-    """Package unique existing files into an in-memory ZIP archive."""
+    """Package unique existing files or (bytes, name) entries into an in-memory ZIP archive."""
     buf = io.BytesIO()
-    seen_paths, seen_names = set(), set()
+    seen_paths, seen_names, count = set(), set(), 0
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
         for item in file_items:
+            data = item.get("data")
             path = item.get("path", "")
-            name = item.get("name", "") or os.path.basename(path)
-            if not path or path in seen_paths or not os.path.exists(path):
-                continue
-            seen_paths.add(path)
+            name = item.get("name", "") or (os.path.basename(path) if path else "document")
+            if data is None:
+                if not path or path in seen_paths or not os.path.exists(path):
+                    continue
+                seen_paths.add(path)
             arcname = name
             n = 1
             while arcname in seen_names:
@@ -489,8 +541,12 @@ def build_zip_bytes(file_items):
                 arcname = f"{stem}_{n}{ext}"
                 n += 1
             seen_names.add(arcname)
-            zf.write(path, arcname=arcname)
-    return buf.getvalue()
+            if data is not None:
+                zf.writestr(arcname, data)
+            else:
+                zf.write(path, arcname=arcname)
+            count += 1
+    return buf.getvalue() if count else b""
 
 
 def label(c):
@@ -737,21 +793,22 @@ def render_msg(m, msg_idx=0):
 
 
 # ---------------- document viewer helper ----------------
-def render_document_viewer(letter, key_suffix=""):
-    path = letter.get("path", "")
+def render_document_viewer(letter, key_suffix="", idx_files=None):
+    path = resolve_letter_path(letter, idx_files)
     name = letter.get("source", "document")
-    if not path or not os.path.exists(path):
+    if not path:
         st.info("Original file is not available on disk.")
         return
 
-    with open(path, "rb") as fh:
-        file_bytes = fh.read()
-    st.download_button(
-        f"⬇️ Download {name}",
-        data=file_bytes,
-        file_name=name,
-        key=f"view_dl_{letter['id']}_{key_suffix}",
-    )
+    dl_bytes, dl_name, dl_mime = get_letter_download(letter, idx_files)
+    if dl_bytes:
+        st.download_button(
+            f"⬇️ Download {dl_name}",
+            data=dl_bytes,
+            file_name=dl_name,
+            mime=dl_mime,
+            key=f"view_dl_{key_suffix or letter['id']}",
+        )
 
     if path.lower().endswith(".pdf"):
         try:
@@ -863,8 +920,9 @@ def letters_page():
         horizontal=True,
         key="dl_scope",
     )
+    idx_files = idx.get("files", [])
     if dl_choice == "All documents (ZIP)":
-        all_files = idx.get("files") or [{"name": l["source"], "path": l.get("path", "")} for l in L]
+        all_files = idx_files or [{"name": l["source"], "path": resolve_letter_path(l, idx_files)} for l in L]
         zip_data = build_zip_bytes(all_files)
         if zip_data:
             st.download_button(
@@ -880,29 +938,43 @@ def letters_page():
         if not selected:
             st.info("Select at least one document above to download.")
         elif len(selected) == 1:
-            l0 = selected[0]
-            p0 = l0.get("path", "")
-            if p0 and os.path.exists(p0):
-                with open(p0, "rb") as fh:
-                    st.download_button(
-                        f"⬇️ Download current document ({l0['source']})",
-                        data=fh.read(),
-                        file_name=l0["source"],
-                        key=f"dl_curr_{l0['id']}",
-                    )
+            dl_bytes, dl_name, dl_mime = get_letter_download(selected[0], idx_files)
+            if dl_bytes:
+                st.download_button(
+                    f"⬇️ Download current document ({dl_name})",
+                    data=dl_bytes,
+                    file_name=dl_name,
+                    mime=dl_mime,
+                    key="dl_curr_btn",
+                )
             else:
                 st.info("Original file is not available on disk.")
         else:
-            sel_files = [{"name": s["source"], "path": s.get("path", "")} for s in selected]
-            sel_zip = build_zip_bytes(sel_files)
+            sel_entries = []
+            for s in selected:
+                b, n, m = get_letter_download(s, idx_files)
+                if b:
+                    sel_entries.append({"name": n, "data": b, "mime": m})
+            sel_zip = build_zip_bytes(sel_entries)
             if sel_zip:
                 st.download_button(
-                    f"📦 Download {len(selected)} selected documents (.zip)",
+                    f"📦 Download {len(sel_entries)} selected documents (.zip)",
                     data=sel_zip,
                     file_name="selected_documents.zip",
                     mime="application/zip",
                     key="dl_sel_zip",
                 )
+                cols_dl = st.columns(min(len(sel_entries), 3))
+                for j, entry in enumerate(sel_entries):
+                    cols_dl[j % len(cols_dl)].download_button(
+                        f"⬇️ {entry['name'][:28]}",
+                        data=entry["data"],
+                        file_name=entry["name"],
+                        mime=entry["mime"],
+                        key=f"dl_sel_item_{j}",
+                    )
+            else:
+                st.info("Selected files are not available on disk.")
 
     if not selected:
         return
@@ -911,7 +983,7 @@ def letters_page():
     with st.expander(f"📄 View selected document(s) ({len(selected)})", expanded=False):
         for i, doc_item in enumerate(selected):
             st.markdown(f"**{i + 1}. {doc_item['source']}** — Letter No. `{doc_item['no'] or 'n/a'}` ({doc_item['date'] or 'n/a'})")
-            render_document_viewer(doc_item, key_suffix=f"multi_{i}")
+            render_document_viewer(doc_item, key_suffix=f"multi_{i}", idx_files=idx_files)
             if i < len(selected) - 1:
                 st.markdown("<hr style='border:0;border-top:1px solid #ffffff22;margin:12px 0;'>", unsafe_allow_html=True)
 
